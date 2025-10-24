@@ -1,0 +1,1281 @@
+                                AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+Technical Information
+AISWEI Interface
+(Based On Modbus Standard Protocol)
+
+
+
+
+Technical Information                       MB001_ASW GEN-Modbus-en_V2.1.1
+AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+   Version                       Comments          Author
+     1.0         First edition                  Jincheng Wang
+     2.1         Upgrade to 2.1 version             Jeff.Ji
+    2.1.1        Upgrade to 2.1.1 version           Jeff.Ji
+
+
+
+
+MB001_ASW GEN-Modbus-en_V2.1.1                    Technical Information
+                                      AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+Legal Provisions
+The information contained in these documents is property of AISWEI New
+Energy Technology (Jiangsu) Co., Ltd. Any publication, whether in whole or in
+part, requires prior written approval by AISWEI New Energy Technology (Jiang-
+su) Co., Ltd. Internal reproduction used solely for the purpose of product eval-
+uation or other proper use is allowed and does not require prior approval.
+
+
+‘Modbus’ herein refers to industrial standard serial communication protocol.
+
+
+
+
+AISWEI New Energy Technology (Jiangsu) Co., Ltd
+Building 9, No.198 Xiangyang Road
+215011 Suzhou
+P.R. China
+Tel. +86 512 6937 0998
+Fax +86 512 6937 3159
+www.aiswei-tech.com
+E-Mail：service.china@aiswei-tech.com
+
+
+
+© 2022 AISWEI New Energy Technology (Jiangsu) Co., Ltd. All rights reserved.
+
+
+
+
+Technical Information                             MB001_ASW GEN-Modbus-en_V2.1.1
+AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+Table of Contents
+1     Information on this Document ............................................. 1
+2     Safety ........................................................................................ 2
+      2.1 Intended Use .............................................................................................. 2
+      2.2 Skills of Qualified Persons ..................................................................... 2
+3     AISWEI Modbus Profile.......................................................... 3
+      3.1 Information on the Assignment Tables ............................................ 3
+      3.2 AISWEI Data Types and NaN Values ................................................. 4
+      3.3 AISWEI Modbus Profile – Register Overview ................................. 5
+      3.4 Warning and Error Codes ....................................................................20
+      3.5 Grid Codes ................................................................................................22
+      3.6 Frame format ...........................................................................................24
+             3.6.1 Read Holding Register (Function Code: 0x03) ............................. 24
+             3.6.2 Read Input Register (Function Code: 0x04) .................................. 25
+             3.6.3 Write Single Holding Register (Function Code: 0x06)............... 26
+             3.6.4 Write Multiple Holding Registers (Function Code: 0x10) ........ 27
+             3.6.5 Write Multiple Holding Registers (Function Code: 0x10) for
+             broadcast................................................................................................................ 28
+             3.6.6 Exception Codes ..................................................................................... 28
+
+4     Contact ................................................................................... 29
+
+
+
+
+AISWEI Modbus Interface |Version 2.1.1                                                                    Technical Information
+                                      AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+1 Information on this Document
+Validity
+This document is valid for AISWEI inverters.
+
+Target Group
+This document is intended for qualified persons. Only persons with appropri-
+ate skills are allowed to perform the tasks described in this document.
+
+Terminology
+
+Information                              Explanation
+
+Pn                                       The rated active power of device
+Pm                                       The instantaneous power when the
+                                         power control curve reaches the start-
+                                         ing point
+Sn                                       The rated apparent power of device
+
+
+
+
+ Technical Information                         MB001_ASW GEN-Modbus-en_V2.1.1   1
+AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+2 Safety
+2.1 Intended Use
+The Modbus interface of the supported devices is designed for industrial use,
+via RS485 or RS422 protocol to enable remote control of the PV system, re-
+mote querying of values, and remote parameter setting.
+
+2.2 Skills of Qualified Persons
+The activities described in this document must only be performed by qualified
+persons. Qualified persons must have the following skills:
+ •    Detailed knowledge of the grid management services
+ •    Knowledge of IP-based network protocols
+ •    Training in the installation and configuration of IT systems
+ •    Knowledge of the Modbus specifications
+ •    Knowledge of and compliance with this document and all safety infor-
+      mation
+
+
+
+
+  2   MB001_ASW GEN-Modbus-en_V2.1.1                          Technical Information
+                                    AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+3 AISWEI Modbus Profile
+3.1 Information on the Assignment Tables
+The assignment tables of the AISWEI Modbus profile present the following
+information:
+
+Information                            Explanation
+
+ADR (DEC)                              Decimal Modbus address, you need
+                                       to remove 3x or 4x and subtract 1,
+                                       then convert to hexadecimal and use
+                                       it in the communication frame. Such
+                                       as 31001 (decimal) → 1000 (decimal)
+                                       → 0x03e8 (hexadecimal)
+Description/                           Short description of the Modbus reg-
+number code(s)                         isters and the number codes used.
+Type                                   Type of the data (see Section 3.2).
+Unit                                   Unit of the data.
+Gain                                   Real value = Gain * output value
+Access                                 RO: Read Only
+                                       RW: Read and Write
+                                       WO: Write Only
+
+
+
+
+ Technical Information                      MB001_ASW GEN-Modbus-en_V2.1.1    3
+AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+3.2 AISWEI Data Types and NaN Values
+The following table shows the data types used in the AISWEI Modbus profile
+and the possible NaN values. The AISWEI data types are listed in the assign-
+ment tables in the Type column. They describe the data widths of the assigned
+values:
+
+
+Type     Description                                         NaN Value
+
+B16      Bit field (16-bit）                                  0xFFFF
+B32      Bit field (32-bit）                                  0xFFFF FFFF
+S16      Signed integer (16-bit）                             0x8000
+U16      Unsigned integer (16-bit）                           0xFFFF
+S32      Signed integer (32-bit）                             0x8000 0000
+U32      Unsigned integer (32-bit）                           0xFFFF FFFF
+E16      Number code（16-bit）                                 0xFFFF
+String String type (16-bit, combination of two 8-bit         0x0000
+       ASCII characters, the high 8-bit is the first ASCII
+       character, and the low 8-bit is the second ASCII
+       character)
+
+
+
+
+  4   MB001_ASW GEN-Modbus-en_V2.1.1                         Technical Information
+                                                   AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+3.3 AISWEI Modbus Profile – Register Overview
+In the following table you will find all the measured values and parameters of
+the AISWEI Modbus Profile.
+Input Registers
+
+
+
+  ADDR(DEC)              Description/number code                   Type Unit Gain Access
+
+
+
+                         Device Type:
+  31001                                                            String    -     -     RO
+                         1=Single phase / 3=Three pahse
+  31002                  Modbus address：Default as 3               U16       -     -     RO
+  31003~31018            Serial Number                             String    -     -     RO
+                         Machine type: for example,
+  31019~31026            "ASW3000", please refer to the            String    -     -     RO
+                         specific machine in practice
+  31027                  Current grid code: refer to Section 3.5    E16      -     -     RO
+  31028~31029            Rated Power                               U32      W     1.0    RO
+  31030~31036            Software Version                          String    -     -     RO
+  31044~31050            Safety Version                            String    -     -     RO
+                         Manufacturer's name: for example,
+  31057~31064            "AISWEI", refer to the specific           String    -     -     RO
+                         machine
+                         Brand name: for example, "AISWEI",
+  31065~31072                                                      String    -     -     RO
+                         please refer to the specific machine
+  31301                  Grid rated voltage                        U16      V     0.1    RO
+  31302                  Grid rated frequency                      U16      Hz    0.01   RO
+  31303~31304            E-Today of inverter                       U32      kWh   0.1    RO
+  31305~31306            E-Total of inverter                       U32      kWh   0.1    RO
+  31307~31308            H-Total                                   U32      H     1.0    RO
+                         Device State:
+                         0 = Wait
+  31309                  1 = Normal                                 E16      -     -     RO
+                         2 = Fault
+                         4 = Checking
+  31310                  Connect time                              U16       s    1.0    RO
+
+
+
+ Technical Information                                       MB001_ASW GEN-Modbus-en_V2.1.1   5
+AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+  31311             Air temperature                 S16   ℃     0.1      RO
+  31312             Inverter U phase temperature    S16   ℃     0.1      RO
+  31313             Inverter V phase temperature    S16   ℃     0.1      RO
+  31314             Inverter W phase temperature    S16   ℃     0.1      RO
+  31315             Boost temperature               S16   ℃     0.1      RO
+                    Bidirectional DC/DC Converter
+  31316                         (*)                 S16   ℃     0.1      RO
+                    temperature
+  31317             Bus voltage                     U16   V     0.1      RO
+  31319             PV1 voltage                     U16   V     0.1      RO
+  31320             PV1 current                     U16   A    0.01      RO
+  31321             PV2 voltage                     U16   V     0.1      RO
+  31322             PV2 current                     U16   A    0.01      RO
+                                  (*)
+  31323             PV3 voltage                     U16   V     0.1      RO
+                                  (*)
+  31324             PV3 current                     U16   A    0.01      RO
+                                  (*)
+  31325             PV4 voltage                     U16   V     0.1      RO
+                                  (*)
+  31326             PV4 current                     U16   A    0.01      RO
+                                  (*)
+  31327             PV5 voltage                     U16   V     0.1      RO
+                                  (*)
+  31328             PV5 current                     U16   A    0.01      RO
+                                        (*)
+  31339             String 1 current                U16   A     0.1      RO
+                                        (*)
+  31340             String 2 current                U16   A     0.1      RO
+                                        (*)
+  31341             String 3 current                U16   A     0.1      RO
+                                        (*)
+  31342             String 4 current                U16   A     0.1      RO
+                                        (*)
+  31343             String 5 current                U16   A     0.1      RO
+                                        (*)
+  31344             String 6 current                U16   A     0.1      RO
+                                        (*)
+  31345             String 7 current                U16   A     0.1      RO
+                                        (*)
+  31346             String 8 current                U16   A     0.1      RO
+                                        (*)
+  31347             String 9 current                U16   A     0.1      RO
+                                          (*)
+  31348             String 10 current               U16   A     0.1      RO
+  31359             L1 Phase voltage                U16   V     0.1      RO
+  31360             L1 Phase current                U16   A     0.1      RO
+                                          (*)
+  31361             L2 Phase voltage                U16   V     0.1      RO
+                                          (*)
+  31362             L2 Phase current                U16   A     0.1      RO
+                                          (*)
+  31363             L3 Phase voltage                U16   V     0.1      RO
+
+
+
+  6   MB001_ASW GEN-Modbus-en_V2.1.1                      Technical Information
+                                                 AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+                                           (*)
+ 31364                  L3 Phase current                         U16     A     0.1     RO
+                                          (*)
+ 31365                  RS Line voltage                          U16     V     0.1     RO
+                                          (*)
+ 31366                  RT Line voltage                          U16     V     0.1     RO
+                                          (*)
+ 31367                  ST Line voltage                          U16     V     0.1     RO
+ 31368                  Grid frequency                           U16     Hz    0.01    RO
+ 31369~31370            Apparent power                           U32    VA     1.0     RO
+ 31371~31372            Active power                             U32     W     1.0     RO
+ 31373~31374            Reactive power                           S32    Var    1.0     RO
+ 31375                  Power factor                             S16      -    0.01    RO
+                        Error message:please refer to section
+ 31378                                                           E16      -     -      RO
+                        3.4
+                        Warning message:please refer to
+ 31379                                                           E16      -     -      RO
+                        section 3.4
+ 31601~31602            PV total power                           U32     W      -      RO
+ 31603~31604            PV E-Today                               U32    kWh    0.1     RO
+ 31605~31606            PV E-Total                               U32    kWh    0.1     RO
+                        Battery communication status:
+ 31607                  0x000A=Normal                            E16      -     -      RO
+                        0x0005=Error
+                        Battery status:
+                        0 = Not available
+                        1 = Idle
+ 31608                                                           E16      -     -      RO
+                        2 = Charging
+                        3 = Discharging
+                        4 = Error
+                        Battery error status :
+                        Bit0 communication data error
+                        0 - valid 1 - invalid
+                        Bit1 cell or module over voltage
+                        0 - valid 1 - invalid
+                        Bit2 cell or module under voltage
+                        0 - valid 1 - invalid
+ 31609                                                           B16      -     -      RO
+                        Bit3 cell temperature is too high
+                        0 - valid 1 - invalid
+                        Bit4 cell temperature too low
+                        0 - valid 1 - invalid
+                        Bit5 discharge over current
+                        0 - valid 1 - invalid
+                        Bit6 charging over current
+
+
+Technical Information                                       MB001_ASW GEN-Modbus-en_V2.1.1   7
+AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+                    0 - valid 1 - invalid
+                    Bit7 internal communication error
+                    0 - valid 1 - invalid
+                    Bit8 cell imbalance
+                    0 - valid 1 - invalid
+                    Undefined bit.:The default value is 1
+                    Battery warning status:
+                    Bit0 communication data error
+                    0 - valid 1 - invalid
+                    Bit1 cell or module voltage high
+                    0 - valid 1 - invalid
+                    Bit2 cell or module voltage low
+                    0 - valid 1 - invalid
+                    Bit3 cell temperature high
+                    0 - valid 1 - invalid
+                    Bit4 cell temperature low
+  31613                                                     B16    -          -       RO
+                    0 - valid 1 - invalid
+                    Bit5 discharge current high
+                    0 - valid 1 - invalid
+                    Bit6 charging current high
+                    0 - valid 1 - invalid
+                    Bit7 internal communication failure
+                    0 - valid 1 - invalid
+                    Bit8 cell imbalance
+                    0 - valid 1 - invalid
+                    Undefined bit.:The default value is 1
+  31617             Battery voltage                         U16   V         0.01      RO
+  31618             Battery current                         S16   A          0.1      RO
+  31619~31620       Battery power                           S32   w          1        RO
+  31621             Battery temperature                     S16   °C         0.1      RO
+  31622             Battery SOC                             U16    -        0.01      RO
+  31623             Battery SOH                             U16    -        0.01      RO
+  31624             Battery charging current limit          U16   A          0.1      RO
+  31625             Battery discharge current limit         U16   A          0.1      RO
+  31626~31627       Battery E-Charge-Today                  U32   kWh        0.1      RO
+  31628~31629       Battery E-Discharge-Today               U32   kWh        0.1      RO
+  31630~31631       E-Consumption-Today at AC side          U32   kWh        0.1      RO
+  31632~31633       E-Generation-Today at AC side           U32   kWh        0.1      RO
+  31634             EPS load voltage                        U16   V          0.1      RO
+
+
+
+  8   MB001_ASW GEN-Modbus-en_V2.1.1                                   Technical Information
+                                                  AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+ 31635                  EPS load current                        U16     A      0.1     RO
+ 31636                  EPS load frequency                      U16     Hz    0.01     RO
+ 31637~31638            EPS load active power                   U32     w      1       RO
+ 31639~31640            EPS load reactive power                 U32     Var    1       RO
+                        E-Consumption-Today at EPS load
+ 31641~31642                                                    U32    kWh     0.1     RO
+                        side
+ 31643~31644            E-Consumption-Total at EPS load side    U32    kWh     0.1     RO
+
+
+
+
+Technical Information                                     MB001_ASW GEN-Modbus-en_V2.1.1    9
+AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+Holding register
+
+
+                   Description/number
+      ADDR(DEC)                                       Type   Unit    Gain Access
+                   code
+
+
+                   Remote switch command:
+      40201        0 = POWER OFF                      E16     -         -       RW
+                   1 = POWER ON
+      41001        RTC:Year                           U16     -         -       RW
+      41002        RTC:Month                          U16     -         -       RW
+      41003        RTC:Day                            U16     -         -       RW
+      41004        RTC:Hour                           U16     -         -       RW
+      41005        RTC:Minute                         U16     -         -       RW
+      41006        RTC:Seconds                        U16     -         -       RW
+                   Storage Inverter Switch：
+      41102        1 - OFF                            E16     -         -       RW
+                   2 - ON
+                   Type selection of energy storage
+                   machine：
+                   0 - Invalid
+                   1 - Energy storage machine
+      41103                                           E16     -         -       RW
+                   2 - Grid off inveter
+                   3 - Grid connected inverter
+                   4 - Force charge with City
+                   electricity (battery wake-up)
+                   Run mode：
+                   0 - Invalid
+                   1 - Off
+      41104                                           E16     -         -       RW
+                   2 - Self generating self use
+                   3 - Backup power supply
+                   4 - Customer defined
+                   Battery manufacturer：
+                   1 - PYLON
+                   2 - DYNESS
+      41105                                           E16     -         -       RW
+                   3 - BYD
+                   4 - LG
+                   5 - AISWEI
+                   Smart meter status：
+      41108                                           E16     -         -       RW
+                   0x000A - Meter Online
+
+
+ 10   MB001_ASW GEN-Modbus-en_V2.1.1                                Technical Information
+                                               AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+                    0x0005 - Meter Offline
+                    Smart meter adjustment flag
+                    bit：
+   41109                                               E16       -        -      RW
+                    0x000A = Start
+                    0x0005 = Stop
+   41110~41111      Set target power value             S32       w        1      RW
+                    Current power value of smart
+   41112~41113                                         S32       w        1      RW
+                    meter
+                    Anti reverse current flag：
+   41114            0x000A = ON                        E16       -        -      RW
+                    0x0005 = OFF
+                    Battery wake-up (Force charge)
+                    sign：
+   41115            0x000A = ON                        E16       -        -      RW
+                    0x0005 = OFF
+                    0xFFFF =Not triggered
+                    Commbox and cloud
+                    communication status：
+                    0x000A = Cloud Online
+   41151                                               E16       -        -      RW
+                    0x0005 = Cloud Offline
+                    0x00AF = Network not
+                    configured
+                    Charge discharge flag bit：
+                    1 - Stop
+   41152                                               E16       -        -      RW
+                    2 - Charging
+                    3 - Discharge
+                    Charge and discharge power
+                    command：
+   41153                                               S16      W         1      RW
+                    ‘ – ’- charging power
+                    ‘ + ’- discharge power
+                    Active power control function：
+   44001            0 = Disable                        E16       -        -      RW
+                    1 = Enable
+                    EEG control function：
+   44002            0 = Disable                        E16       -        -      RW
+                    1 = Enable
+                    Slope load function：
+   44003            0 = Disable                        E16       -        -      RW
+                    1 = Enable
+   44004            Overvoltage reduce power           E16       -        -      RW
+
+
+Technical Information                                  MB001_ASW GEN-Modbus-en_V2.1.1    11
+AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+                   function：
+                   0 = Disable
+                   1 = Enable
+                   Overfrequency reduce power
+                   function：
+      44005                                          E16   -        -       RW
+                   0 = Disable
+                   1 = Enable
+                   Reactive power control
+                   fucntion：
+      44006                                          E16   -        -       RW
+                   0 = Disable
+                   1 = Enable
+                   LVRT Function：
+      44007        0 = Disable                       E16   -        -       RW
+                   1 = Enable
+                   10 Minutes Average Overvoltage
+                   protect fucntion
+      44009                                          E16   -        -       RW
+                   0 = Disable
+                   1 = Enable
+                   Islanding protect function：
+      44010        0 = Disable                       E16   -        -       RW
+                   1 = Enable
+                   PE connnection check function：
+      44012        0 = Disable                       E16   -        -       RW
+                   1 = Enable
+                   Overload function：
+      44017        0 = Disable                       E16   -        -       RW
+                   1 = Enable
+                                            (*)
+                   Shadow MPPT function :
+      44025        0 = Disable                       E16   -        -       RW
+                   1 = Enable
+                   Grid code：please refer to
+      45201                                          E16   -        -       RW
+                   section 3.5
+                   Overvoltage protection value of
+      45202                                          U16   V       0.1      RW
+                   the first grid connection
+                   Overvoltage protection value of
+      45203                                          U16   V       0.1      RW
+                   the first grid connection
+                   Overvoltage protection value of
+      45204                                          U16   Hz     0.01      RW
+                   the first grid connection
+                   Underfrequency protection value
+      45205                                          U16   Hz     0.01      RW
+                   for first grid connection
+
+
+ 12   MB001_ASW GEN-Modbus-en_V2.1.1                            Technical Information
+                                                AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+   45206            Grid Voltage High Limit3            U16       V       0.1     RW
+   45207~45208      Grid Voltage High Limit Time3       U32      ms       1.0     RW
+   45209            Grid Voltage High Limit2            U16       V       0.1     RW
+   45210~45211      Grid Voltage High Limit Time2       U32      ms       1.0     RW
+   45212            Grid Voltage High Limit1            U16       V       0.1     RW
+   45213~45214      Grid Voltage High Limit Time1       U32      ms       1.0     RW
+   45215            Grid Voltage Low Limit3             U16       V       0.1     RW
+   45216~45217      Grid Voltage Low Limit Time3        U32      ms       1.0     RW
+   45218            Grid Voltage Low Limit2             U16       V       0.1     RW
+   45219~45220      Grid Voltage Low Limit Time2        U32      ms       1.0     RW
+   45221            Grid Voltage Low Limit1             U16       V       0.1     RW
+   45222~45223      Grid Voltage Low Limit Time1        U32      ms       1.0     RW
+                    10 Minutes Average Overvoltage
+   45224                                                U16       V       0.1     RW
+                    Threshold
+                    10 Minutes Average Overvoltage
+   45225                                                U16      ms       1.0     RW
+                    Portect Time
+   45226            Overvoltage recover value           U16       V       0.1     RW
+   45227            Undervoltage recover value          U16       V       0.1     RW
+   45228            Grid Frequency High Limit3          U16      Hz       0.01    RW
+                    Grid Frequency High Limit
+   45229~45230                                          U32      ms       1.0     RW
+                    Time3
+   45231            Grid Frequency High Limit2          U16      Hz       0.01    RW
+                    Grid Frequency High Limit
+   45232~45233                                          U32      ms       1.0     RW
+                    Time2
+   45234            Grid Frequency High Limit1          U16      Hz       0.01    RW
+                    Grid Frequency High Limit
+   45235~45236                                          U32      ms       1.0     RW
+                    Time1
+   45237            Grid Frequency Low Limit3           U16      Hz       0.01    RW
+                    Grid Frequency Low Limit
+   45238~45239                                          U32      ms       1.0     RW
+                    Time3
+   45240            Grid Frequency Low Limit2           U16      Hz       0.01    RW
+                    Grid Frequency Low Limit
+   45241~45242                                          U32      ms       1.0     RW
+                    Time2
+   45243            Grid Frequency Low Limit1           U16      Hz       0.01    RW
+   45244~45245      Grid Frequency Low Limit            U32      ms       1.0     RW
+
+
+Technical Information                                   MB001_ASW GEN-Modbus-en_V2.1.1    13
+AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+                    Time1
+                    Vary rate of Frequecny protect
+      45246                                              U16     Hz/s       0.01      RW
+                    value
+                    Vary rate of Frequecny protect
+      45247~45248                                        U32      ms         1.0      RW
+                    time
+      45249         Overfrequency recover value          U16      Hz        0.01      RW
+      45250         Underfrequency recover value         U16      Hz        0.01      RW
+      45251         Time of first connection to grid     U16      s          1.0      RW
+      45252         Time of re-connection to grid        U16      s          1.0      RW
+      45253         ISO protect threshold                U16      kΩ         1.0      RW
+      45254         DCI protect threshold                U16     mA          1.0      RW
+      45255         DCI protect time                     U16      ms         1.0      RW
+                    Load rate of first connection to
+      45401                                              U16   %Pn/min       1.0      RW
+                    grid
+      45402         Load rate of re-connection to grid   U16   %Pn/min       1.0      RW
+      45403         Active Power Set                     U16     %Pn        0.01      RW
+      45404         Increase rate of active power        U16   %Pn/min      0.01      RW
+      45405         Decrease rate of active power        U16   %Pn/min      0.01      RW
+                    Over frequency reduce power
+                    mode：
+                    0 = None
+                    1 = Fixed reduction ratio, non –
+                    hysteresis
+      45408         2 = Fixed reduction ratio,           E16      -           -       RW
+                    hysteresis
+                    3 = Not fixed reduction ratio, non
+                    – hysteresis
+                    4 = Not fixed reduction ratio,
+                    hysteresis
+                    Over frequency reduce power:
+      45409                                              U16      Hz        0.01      RW
+                    Start frequency
+                    Over frequency reduce power:
+      45410                                              U16      Hz        0.01      RW
+                    Stop frequecny
+                    Over frequency reduce power:
+      45411                                              U16      Hz        0.01      RW
+                    Back frequency
+                    The reduce ratio of over
+      45412                                              U16   %Pnor%Pm     0.01      RW
+                    frequency reduce power
+
+
+
+ 14   MB001_ASW GEN-Modbus-en_V2.1.1                                      Technical Information
+                                               AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+                    Over frequency reduce
+   45413                                                 U16      s       0.1    RW
+                    power :reduce power delay time
+                    Over frequency reduce
+   45414                                                 U16      s       0.1    RW
+                    power:recover power delay time
+                    Speed of Over frequency recover
+   45416                                                 U16   %Pn/min    0.01   RW
+                    to Pn
+                                                  (*)
+                    Over frequency reduce power :
+   45417                                                 U16      Hz      0.01   RW
+                    0 power frequency point
+                    Over voltage reduce power
+                    mode：
+                    0 = None
+                    1 = Not fixed reduction ratio, non
+                    – hysteresis
+   45419            2 = Not fixed reduction ratio,       E16      -        -     RW
+                    hysteresis
+                    3 = Fixed reduction ratio, non –
+                    hysteresis
+                    4 = Fixed reduction ratio,
+                    hysteresis
+                    Over voltage reduce power:
+   45420                                                 U16     %Un      0.01   RW
+                    Start voltage
+                    Over voltage reduce power:
+   45422                                                 U16     %Un      0.01   RW
+                    Stop voltage
+                    Over voltage reduce power:
+   45424                                                 U16     %Un      0.01   RW
+                    Back voltage
+                    The reduce ratio of over voltage
+   45426                                                 U16   %Pnor%Pm   0.01   RW
+                    reduce power
+                    Over voltage reduce power delay
+   45427                                                 U16      s       0.1    RW
+                    time
+                    Over voltage recover power
+   45428                                                 U16      s       0.1    RW
+                    delay time
+                    Speed of Over voltage recover to
+   45429                                                 U16   %Pn/min    0.01   RW
+                    Pn
+                    Under frequency increase power
+                    mode：
+                    0 = None
+   45432            1 = Fixed reduction ratio, non –     E16      -        -     RW
+                    hysteresis
+                    2 = Fixed reduction ratio,
+                    hysteresis
+
+
+Technical Information                                    MB001_ASW GEN-Modbus-en_V2.1.1   15
+AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+                   3 = Not fixed reduction ratio, non
+                   – hysteresis
+                   4 = Not fixed reduction ratio,
+                   hysteresis
+                   Under frequency increase power:
+      45433                                             U16      Hz        0.01      RW
+                   Start frequency
+                   Under frequency increase power:
+      45434                                             U16      Hz        0.01      RW
+                   Stop frequecny
+                   Under frequency increase power:
+      45435                                             U16      Hz        0.01      RW
+                   Back frequency
+                   The increase ratio of under
+      45436                                             U16   %Pnor%Pm     0.01      RW
+                   frequency increase power
+                   Under frequency increase power
+      45437                                             U16      s          0.1      RW
+                   delay time
+                   Under frequency recover power
+      45438                                             U16      s          0.1      RW
+                   delay time
+                   Speed of Under frequency
+      45440                                             U16   %Pn/min      0.01      RW
+                   recover to Pn
+                   Under frequency increase power
+      45441                                             U16      Hz        0.01      RW
+                   0 power frequency point
+                   Under voltage increase power
+                   mode：
+                   0 = None
+                   1 = Fixed increase ratio, non –
+                   hysteresis
+      45443        2 = Fixed increase ratio,            E16      -           -       RW
+                   hysteresis
+                   3 = Not fixed increase ratio, non
+                   – hysteresis
+                   4 = Not fixed increase ratio,
+                   hysteresis
+                   Under voltage increase power:
+      45444                                             U16     %Un        0.01      RW
+                   Start voltage
+                   Under voltage increase power:
+      45445                                             U16     %Un        0.01      RW
+                   Stop voltage
+                   Under voltage increase power:
+      45446                                             U16     %Un        0.01      RW
+                   Back voltage
+                   The increase ratio of under
+      45447                                             U16   %Pnor%Pm     0.01      RW
+                   voltage increase power
+
+
+
+ 16   MB001_ASW GEN-Modbus-en_V2.1.1                                     Technical Information
+                                                AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+                    Under voltage increase power
+   45448                                                U16       s       0.1     RW
+                    delay time
+                    Under voltage increase power
+   45449                                                U16       s       0.1     RW
+                    delay time
+                    Speed of under voltage recover to
+   45450                                                U16    %Pn/min    0.01    RW
+                    Pn
+                          (*)
+   45451            Pav                                 S16     %Pn       0.01    RW
+                                (*)
+   45452            DRMs Pval                           U16     %Pn       0.01    RW
+                    Reactive power control mode：
+                    0 = None
+                    1 = Fixed power factor
+                    2 = cos φ(P) curve
+   45501                                                E16       -        -      RW
+                    3 = Fixed Q value
+                    4 = Fixed Q value of AU DRMs
+                    5 = Linear Q(U) curve
+                    6 = Hysteresis Q(U) curve
+                    Time constant of reactive power
+   45502                                                U16       s       1.0     RW
+                    curve
+   45503            Power factor                        S16       -      0.0001   RW
+                    cos φ(P) curve：
+   45504                                                U16     %Pn       0.01    RW
+                    Active power of the first point
+                    cos φ(P) curve：
+   45505                                                S16       -      0.0001   RW
+                    cos φ of the first point
+                    cos φ(P) curve：
+   45506                                                U16     %Pn       0.01    RW
+                    Active power of the second point
+                    cos φ(P) curve：
+   45507                                                S16       -      0.0001   RW
+                    cos φ of the second point
+                    cos φ(P) curve：
+   45508                                                U16     %Pn       0.01    RW
+                    Active power of the third point
+                    cos φ(P) curve：
+   45509                                                S16       -      0.0001   RW
+                    cos φ of the third point
+                    cos φ(P) curve：
+   45510                                                U16     %Pn       0.01    RW
+                    Active power of the fourth point
+                    cos φ(P) curve：
+   45511                                                S16       -      0.0001   RW
+                    cos φ of the fourth point
+                    Lock in voltage (for cos φ(P)
+   45512                                                U16     %Un       0.01    RW
+                    curve）
+   45513            Lock out voltage (for cos φ(P)      U16     %Un       0.01    RW
+
+
+
+Technical Information                                   MB001_ASW GEN-Modbus-en_V2.1.1    17
+AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+                   curve)
+      45516        Q Set Value                         S16   %Sn     0.01      RW
+                   Q(U) curve：
+      45518                                            U16   %Un     0.01      RW
+                   U of the first point
+                   Q(U) curve：
+      45519                                            S16   %Sn     0.01      RW
+                   Q of the first point
+                   Q(U) curve：
+      45520                                            U16   %Un     0.01      RW
+                   U of the second point
+                   Q(U) curve：
+      45521                                            S16   %Sn     0.01      RW
+                   Q of the second point
+                   Q(U) curve：
+      45522                                            U16   %Un     0.01      RW
+                   U of the third point
+                   Q(U) curve：
+      45523                                            S16   %Sn     0.01      RW
+                   Q of the third point
+                   Q(U) curve：
+      45524                                            U16   %Un     0.01      RW
+                   U of the fourth point
+                   Q(U) curve：
+      45525                                            S16   %Sn     0.01      RW
+                   Q of the fourth point
+                   Lock in power（for Q(U)
+      45526                                            U16   %Pn     0.01      RW
+                   curve）
+                   Lock outpower（for Q(U)
+      45527                                            U16   %Pn     0.01      RW
+                   curve）
+      45606        LVRT Trigger voltage                U16   %Un     0.01      RW
+                   LVRT active power limit
+                   mode：
+      45609        0 = None                            E16    -        -       RW
+                   1 = Limit (Default as limit to 0)
+                   2 = Limit to 0
+
+
+
+
+ 18   MB001_ASW GEN-Modbus-en_V2.1.1                               Technical Information
+                                            AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+(*) ------ Supported on some models
+31601~31644，41102~41153，45432~45450 Special for storage inverter
+
+
+
+
+ Technical Information                              MB001_ASW GEN-Modbus-en_V2.1.1    19
+AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+3.4 Warning and Error Codes
+
+Warning Code              Description
+
+
+0                         No warning
+30                        Recover from warning
+150                       SPD Damaged
+156                       Internal fan warning
+157                       External fan warning
+163                       String current abnormal
+165                       Ground connect warning
+166                       CPU self-test ---- Register abnornal
+167                       CPU self-test ---- RAM abnornal
+168                       CPU self-test ---- ROM abnornal
+174                       Low Air Temprature
+175                       Battery Soc Low
+176                       Battery Fault Status
+177                       Battery Communication DisConnect
+178                       EPS Output Over
+179                       Combox and Cloud Disconnect
+180                       PV string inverse
+
+
+
+
+    20   MB001_ASW GEN-Modbus-en_V2.1.1                          Technical Information
+                                                  AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+Error Code                  Description
+
+
+1                           Communication Fails between M-S
+3                           Relay check Fail
+4                           DC Injection High
+5                           The result of Auto Test Function is fail
+6                           DC bus is too high
+8                           AC HCT Failure
+9                           GFCI Device Failure
+10                          Device fault
+32                          ROCOF Fault
+33                          Fac Faulure :Fac Out of Range
+34                          AC Voltage Out of Range
+35                          Utility Loss
+36                          GFCI Failure
+37                          PV Over Voltage
+38                          Isolation Fault
+40                          Over temperature in Inverter
+41                          Consistent Fault :Vac differs for M-S
+42                          Consistent Fault :Fac differs for M-S
+43                          Consistent Fault :Groud I differs for M-S
+44                          Consistent Fault :DC inj. Differs for M-S
+45                          Consistent Fault :Fac,Vac differs for M-S
+46                          High DC bus
+47                          Consistent Fault
+48                          Average volt of ten minutes Fault
+56                          GFCI protect fault:30mA level
+57                          GFCI protect fault:60mA level
+58                          GFCI protect fault:150mA level
+61                          DRMS Communication Fails(S9 Open)
+62                          DRMS order disconnection device(S0 Close)
+65                          PE connection Fault
+
+
+    Technical Information                                   MB001_ASW GEN-Modbus-en_V2.1.1   21
+AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+3.5 Grid Codes
+Grid Code                 Description
+35                        NB/T32004:2018
+47                        AU AS 4777.2 : 2015
+48                        NZ AS 4777.2 : 2015
+49                        ENGG-50Hz
+50                        ENGG-60Hz
+59                        CNS15382:2018
+64                        EN 50549-1
+65                        NL EN50549-1:2019
+66                        BR NBR 16149:2013
+67                        VDE0126-1-1/A1/VFR
+68                        IEC 61727 50Hz
+69                        C10/11:2019
+70                        VDE-AR-N4105:2018
+71                        IEC 61727 60Hz
+72                        G98/1
+73                        G99/1
+74                        AU AS/NZS4777.2:2020 A
+75                        AU AS/NZS4777.2:2020 B
+76                        AU AS/NZS4777.2:2020 C
+77                        NZ AS/NZS4777.2:2020
+78                        IL SI4777.3
+79                        KR KS C 8565:2020
+80                        ES UNE206007-1
+81                        CY EN50549-1
+82                        CS PPDS A1
+83                        PL EN50549-1
+84                        CEI 0-21:2019
+85                        DK EN50549-1
+86                        CH NA/EEA-NE7
+
+
+
+
+ 22   MB001_ASW GEN-Modbus-en_V2.1.1               Technical Information
+                                        AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+87                       SE EIFS:2018
+88                       FI EN50549-1
+89                       RO Order208
+90                       SI EN50549-1
+91                       LV EN50549-1
+92                       VDE0126/VFR2019 IS (50Hz)
+93                       VDE0126/VFR2019 IS (60Hz)
+
+
+
+
+ Technical Information                          MB001_ASW GEN-Modbus-en_V2.1.1    23
+AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+3.6 Frame format
+MODBUS protocol format: RTU format. Each communication data unit is
+composed of 1 bit starting bit, 8 bit data bit and 1 bit stopping bit, no parity .
+MODBUS function codes:
+      •      Read Holding Register (0x03)
+      •      Read Input Register (0x04)
+      •      Write Holding Single Register (0x06)
+      •      Write Holding Multiple Registers (0x10)
+      •      Write Holding Multiple Registers (0x10) for broadcast
+
+3.6.1 Read Holding Register (Function Code: 0x03)
+Request:
+ Device ID                        1 Byte
+ Function code                    1 Byte
+ Register Address(Hi)             1 Byte
+ Register Address(Lo)             1 Byte
+ Register length                  2 Byte
+ CRC(Lo)                          1 Byte
+ CRC(Hi)                          1 Byte
+
+
+Response:
+ Device ID                        1 Byte
+ Function code                    1 Byte
+ Byte count                       1 Byte
+ Data                             N × 1 Byte
+ CRC(Lo)                          1 Byte
+ CRC(Hi)                          1 Byte
+
+
+Error：
+ Device ID                        1 Byte
+ Function code + 0x80             1 Byte
+ Exception code                   1 Byte
+ CRC(Lo)                          1 Byte
+ CRC(Hi)                          1 Byte
+
+
+
+ 24       MB001_ASW GEN-Modbus-en_V2.1.1                       Technical Information
+                                  AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+3.6.2 Read Input Register (Function Code: 0x04)
+Request:
+ Device ID               1 Byte
+ Function code           1 Byte
+ Register Address(Hi)    1 Byte
+ Register Address(Lo)    1 Byte
+ Register length         2 Byte
+ CRC(Lo)                 1 Byte
+ CRC(Hi)                 1 Byte
+
+
+Response:
+ Device ID               1 Byte
+ Function code           1 Byte
+ Byte count              1 Byte
+ Data                    N × 1 Byte
+ CRC(Lo)                 1 Byte
+ CRC(Hi)                 1 Byte
+
+
+Error：
+ Device ID               1 Byte
+ Function code + 0x80    1 Byte
+ Exception code          1 Byte
+ CRC(Lo)                 1 Byte
+ CRC(Hi)                 1 Byte
+
+
+
+
+ Technical Information                    MB001_ASW GEN-Modbus-en_V2.1.1    25
+AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+3.6.3 Write Single Holding Register (Function Code: 0x06)
+Request:
+ Device ID                     1 Byte
+ Function code                 1 Byte
+ Register Address(Hi)          1 Byte
+ Register Address(Lo)          1 Byte
+ Data                          2 Byte
+ CRC(Lo)                       1 Byte
+ CRC(Hi)                       1 Byte
+
+
+Response:
+ Device ID                     1 Byte
+ Function code                 1 Byte
+ Register Address(Hi)          1 Byte
+ Register Address(Lo)          1 Byte
+ Data                          2 Byte
+ CRC(Lo)                       1 Byte
+ CRC(Hi)                       1 Byte
+
+
+Error:
+ Device ID                     1 Byte
+ Function code + 0x80          1 Byte
+ Exception code                1 Byte
+ CRC(Lo)                       1 Byte
+ CRC(Hi)                       1 Byte
+
+
+
+
+ 26   MB001_ASW GEN-Modbus-en_V2.1.1            Technical Information
+                                  AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+3.6.4 Write Multiple Holding Registers (Function Code: 0x10)
+Request:
+ Device ID               1 Byte
+ Function code           1 Byte
+ Register Address(Hi)    1 Byte
+ Register Address(Lo)    1 Byte
+ Register length         2 Byte
+ Data length             1 Byte
+ Data                    N × 1Byte
+ CRC(Lo)                 1 Byte
+ CRC(Hi)                 1 Byte
+
+
+Response:
+ Device ID               1 Byte
+ Function code           1 Byte
+ Register Address(Hi)    1 Byte
+ Register Address(Lo)    1 Byte
+ Register length         2 Byte
+ CRC(Lo)                 1 Byte
+ CRC(Hi)                 1 Byte
+
+
+Error:
+ Device ID               1 Byte
+ Function code + 0x80    1 Byte
+ Exception code          1 Byte
+ CRC(Lo)                 1 Byte
+ CRC(Hi)                 1 Byte
+
+
+
+
+ Technical Information                    MB001_ASW GEN-Modbus-en_V2.1.1    27
+AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+3.6.5 Write Multiple Holding Registers (Function Code: 0x10)
+      for broadcast
+Request:
+ Device ID                      1 Byte
+ Function code                  1 Byte
+ Register Address(Hi)           1 Byte
+ Register Address(Lo)           1 Byte
+ Register length                2 Byte
+ Data length                    1 Byte
+ Data                           N × 1Byte
+ CRC(Lo)                        1 Byte
+ CRC(Hi)                        1 Byte
+
+
+Response: none
+
+3.6.6 Exception Codes
+0x01     Illegal function
+0x02     Illegal address
+0x03     Illegal data
+0x04     Slave device failure
+
+
+
+
+ 28    MB001_ASW GEN-Modbus-en_V2.1.1           Technical Information
+                                     AISWEI New Energy Technology(Jiangsu）Co., Ltd
+
+
+
+
+4 Contact
+If you experience any technical problems with our products, please contact the
+AISWEI Service Hotline to provide you with the necessary assistance:
+
+AISWEI New Energy Technology (Jiangsu) Co., Ltd.
+No 198, Xiangyang Road
+215011 Suzhou (China)
+
+
+
+
+ Technical Information                       MB001_ASW GEN-Modbus-en_V2.1.1    29
+
