@@ -2,6 +2,7 @@
 #include <esp32ModbusRTU.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include "modbus_registers.h"
 
 // translate AISWEI warning codes to descriptive strings
 const char* warnCodeToString(uint16_t code) {
@@ -158,6 +159,149 @@ static void ensureMqttConnected() {
 // extern modbus object
 esp32ModbusRTU modbus(&Serial1, 16);  // use Serial1 and pin 16 as RTS
 
+// helper: decode a single Modbus response and publish a human friendly payload to MQTT
+static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc, uint16_t address, uint8_t* data, size_t length) {
+    // prepare topic: joba_aiswei/modbus/<server>/<addr>
+    char topic[128];
+    snprintf(topic, sizeof(topic), "%s/modbus/%u/%u", mqttPrefix, serverAddress, address);
+
+    // find matching register definition by comparing register offsets
+    const RegisterInfo* ri = nullptr;
+    for (size_t i = 0; i < aiswei_registers_count; ++i) {
+        const RegisterInfo &r = aiswei_registers[i];
+        uint16_t regOff = aiswei_dec2reg(r.addr);
+        if (address >= regOff && address < regOff + r.length) {
+            ri = &r;
+            break;
+        }
+    }
+
+    char payload[128] = {0};
+
+    if (!ri) {
+        // no metadata found -> fallback to previous behavior (float if 4 bytes, else hex)
+        if (length == 4) {
+            uint8_t tmp[4];
+            for (int i = 0; i < 4; ++i) tmp[i] = data[3 - i];
+            float value;
+            memcpy(&value, tmp, sizeof(value));
+            snprintf(payload, sizeof(payload), "%.3f", value);
+            if (mqttClient.connected()) mqttClient.publish(topic, payload);
+            Serial.printf("decoded float: %s\n\n", payload);
+            return;
+        }
+
+        // publish hex payload if unknown
+        size_t pos = 0;
+        for (size_t i = 0; i < length && pos + 3 < sizeof(payload); ++i) {
+            pos += snprintf(payload + pos, sizeof(payload) - pos, "%02x", data[i]);
+        }
+        payload[pos] = '\0';
+        if (mqttClient.connected()) mqttClient.publish(topic, payload);
+        Serial.printf("no register meta -> hex: %s\n\n", payload);
+        return;
+    }
+
+    // At this point we have a register info 'ri'. Decode according to ri->type.
+    const char* type = ri->type ? ri->type : "";
+    // helper to format numeric with gain
+    auto fmt_with_gain = [&](double raw) {
+        double val = raw * ri->gain;
+        // choose precision heuristically
+        int prec = 0;
+        if (ri->gain < 1.0) {
+            // simple mapping for common gains
+            if (ri->gain == 0.1) prec = 1;
+            else if (ri->gain == 0.01) prec = 2;
+            else if (ri->gain == 0.001) prec = 3;
+            else prec = 3;
+        }
+        if (prec == 0) snprintf(payload, sizeof(payload), "%.0f", val);
+        else {
+            char fmt[8];
+            snprintf(fmt, sizeof(fmt), "%%.%df", prec);
+            snprintf(payload, sizeof(payload), fmt, val);
+        }
+    };
+
+    if (strcmp(type, "String") == 0) {
+        // interpret register bytes as ASCII characters (high byte then low byte per register)
+        size_t pos = 0;
+        for (size_t i = 0; i + 1 < length && pos + 1 < sizeof(payload); i += 2) {
+            char hi = (char)data[i];
+            char lo = (char)data[i + 1];
+            if (hi >= 32 && hi <= 126) payload[pos++] = hi;
+            if (lo >= 32 && lo <= 126 && pos + 1 < sizeof(payload)) payload[pos++] = lo;
+        }
+        payload[pos] = '\0';
+        if (payload[0] == '\0') strncpy(payload, "<empty>", sizeof(payload));
+        if (mqttClient.connected()) mqttClient.publish(topic, payload);
+        Serial.printf("%s -> %s\n\n", ri->name, payload);
+        return;
+    }
+
+    if (strcmp(type, "U16") == 0 || strcmp(type, "E16") == 0 || strcmp(type, "B16") == 0 || strcmp(type, "S16") == 0) {
+        if (length < 2) {
+            snprintf(payload, sizeof(payload), "<too short>");
+        } else {
+            uint16_t raw = (uint16_t)data[0] << 8 | data[1];
+            if (strcmp(type, "U16") == 0) {
+                fmt_with_gain(raw);
+            } else if (strcmp(type, "S16") == 0) {
+                int16_t s = (int16_t)raw;
+                fmt_with_gain(s);
+            } else if (strcmp(type, "E16") == 0) {
+                // choose appropriate enum translation by name hint
+                if (strstr(ri->name, "Warning") || strstr(ri->name, "warning")) {
+                    const char* s = warnCodeToString(raw);
+                    snprintf(payload, sizeof(payload), "%u (%s)", raw, s);
+                } else if (strstr(ri->name, "Error") || strstr(ri->name, "error")) {
+                    const char* s = errorCodeToString(raw);
+                    snprintf(payload, sizeof(payload), "%u (%s)", raw, s);
+                } else if (strstr(ri->name, "Grid") || strstr(ri->name, "grid")) {
+                    const char* s = gridCodeToString(raw);
+                    snprintf(payload, sizeof(payload), "%u (%s)", raw, s);
+                } else {
+                    snprintf(payload, sizeof(payload), "%u", raw);
+                }
+            } else { // B16
+                snprintf(payload, sizeof(payload), "0x%04x", raw);
+            }
+        }
+        if (mqttClient.connected()) mqttClient.publish(topic, payload);
+        Serial.printf("%s -> %s\n\n", ri->name, payload);
+        return;
+    }
+
+    if (strcmp(type, "U32") == 0 || strcmp(type, "S32") == 0) {
+        if (length < 4) {
+            snprintf(payload, sizeof(payload), "<too short>");
+        } else {
+            uint32_t raw = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | (uint32_t)data[3];
+            if (strcmp(type, "S32") == 0) {
+                int32_t s = (int32_t)raw;
+                fmt_with_gain(s);
+            } else {
+                fmt_with_gain(raw);
+            }
+        }
+        if (mqttClient.connected()) mqttClient.publish(topic, payload);
+        Serial.printf("%s -> %s\n\n", ri->name, payload);
+        return;
+    }
+
+    // fallback: publish hex
+    {
+        size_t pos = 0;
+        for (size_t i = 0; i < length && pos + 3 < sizeof(payload); ++i) {
+            pos += snprintf(payload + pos, sizeof(payload) - pos, "%02x", data[i]);
+        }
+        payload[pos] = '\0';
+        if (mqttClient.connected()) mqttClient.publish(topic, payload);
+        Serial.printf("%s -> %s (hex)\n\n", ri->name, payload);
+    }
+}
+
 void setup() {
     Serial.begin(115200);
     Serial1.begin(9600, SERIAL_8N1, 17, 4, true);  // Modbus connection
@@ -172,37 +316,8 @@ void setup() {
         }
         Serial.printf("\n");
 
-        // prepare topic: joba_aiswei/modbus/<server>/<addr>
-        char topic[128];
-        snprintf(topic, sizeof(topic), "%s/modbus/%u/%u", mqttPrefix, serverAddress, address);
-
-        // If payload is 4 bytes, try to interpret as float (fix endianness first)
-        if (length == 4) {
-            uint8_t tmp[4];
-            // copy and reverse for little-endian float assumed by device
-            for (int i = 0; i < 4; ++i) tmp[i] = data[3 - i];
-            float value;
-            memcpy(&value, tmp, sizeof(value));
-            char payload[64];
-            snprintf(payload, sizeof(payload), "%.3f", value);
-            if (mqttClient.connected()) {
-                mqttClient.publish(topic, payload);
-            }
-            Serial.printf("val: %.3f\n\n", value);
-            return;
-        }
-
-        // otherwise publish hex payload
-        char payloadHex[128];
-        size_t pos = 0;
-        for (size_t i = 0; i < length && pos + 3 < sizeof(payloadHex); ++i) {
-            pos += snprintf(payloadHex + pos, sizeof(payloadHex) - pos, "%02x", data[i]);
-        }
-        payloadHex[pos] = '\0';
-        if (mqttClient.connected()) {
-            mqttClient.publish(topic, payloadHex);
-        }
-        Serial.print("\n");
+        // decode according to AISWEI register metadata and publish readable payload
+        decodeAndPublish(serverAddress, fc, address, data, length);
     });
 
     modbus.onError([](esp32Modbus::Error error) {
