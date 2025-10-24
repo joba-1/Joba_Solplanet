@@ -212,6 +212,28 @@ const RegisterInfo aiswei_registers[] = {
 
     /* 45432.. Under/Over frequency groups, DRMs etc (some repeated in doc) */
     {45432, 1,  "Under frequency increase power mode", "E16", NULL, 1.0f, "RW"},
+    {45433, 1,  "Under frequency increase power: Start frequency", "U16", "Hz", 0.01f, "RW"},
+    {45434, 1,  "Under frequency increase power: Stop frequency",  "U16", "Hz", 0.01f, "RW"},
+    {45435, 1,  "Under frequency increase power: Back frequency",  "U16", "Hz", 0.01f, "RW"},
+    {45436, 1,  "The increase ratio of under frequency increase power", "U16", "%Pnor%Pm", 0.01f, "RW"},
+    {45437, 1,  "Under frequency increase power: delay time", "U16", "s", 0.1f, "RW"},
+    {45438, 1,  "Under frequency recover power: delay time", "U16", "s", 0.1f, "RW"},
+    {45440, 1,  "Speed of Under frequency recover to Pn", "U16", "%Pn/min", 0.01f, "RW"},
+    {45441, 1,  "Under frequency increase power: 0 power frequency point", "U16", "Hz", 0.01f, "RW"},
+
+    /* Under-voltage increase power group (45443..45450) */
+    {45443, 1,  "Under voltage increase power mode", "E16", NULL, 1.0f, "RW"},
+    {45444, 1,  "Under voltage increase power: Start voltage", "U16", "%Un", 0.01f, "RW"},
+    {45445, 1,  "Under voltage increase power: Stop voltage",  "U16", "%Un", 0.01f, "RW"},
+    {45446, 1,  "Under voltage increase power: Back voltage",  "U16", "%Un", 0.01f, "RW"},
+    {45447, 1,  "The increase ratio of under voltage increase power", "U16", "%Pnor%Pm", 0.01f, "RW"},
+    {45448, 1,  "Under voltage increase power: delay time", "U16", "s", 0.1f, "RW"},
+    {45449, 1,  "Under voltage increase power: delay time 2", "U16", "s", 0.1f, "RW"},
+    {45450, 1,  "Speed of under voltage recover to Pn", "U16", "%Pn/min", 0.01f, "RW"},
+
+    /* DRMs / Pav entries */
+    {45451, 1,  "Pav", "S16", "%Pn", 0.01f, "RW"},
+    {45452, 1,  "DRMs Pval", "U16", "%Pn", 0.01f, "RW"},
 
     /* 455xx reactive/power-factor control */
     {45501, 1,  "Reactive power control mode", "E16", NULL, 1.0f, "RW"},
@@ -243,6 +265,7 @@ const RegisterInfo aiswei_registers[] = {
     {45609, 1,  "LVRT active power limit mode", "E16",    NULL, 1.0f, "RW"},
 };
 
+// define count of entries
 const size_t aiswei_registers_count = sizeof(aiswei_registers) / sizeof(aiswei_registers[0]);
 
 int aiswei_find_register_index(uint32_t addr_dec) {
@@ -303,6 +326,7 @@ void inverterUphaseTemperature_C(uint8_t slave) { requestAisweiRead(slave, 31312
 void inverterVphaseTemperature_C(uint8_t slave) { requestAisweiRead(slave, 31313); }
 void inverterWphaseTemperature_C(uint8_t slave) { requestAisweiRead(slave, 31314); }
 void boostTemperature_C(uint8_t slave) { requestAisweiRead(slave, 31315); }
+void bidirectionalDCDCtemperature_C(uint8_t slave) { requestAisweiRead(slave, 31316);}
 void busVoltage_V(uint8_t slave) { requestAisweiRead(slave, 31317); }
 
 void pv1Voltage_V(uint8_t slave) { requestAisweiRead(slave, 31319); }

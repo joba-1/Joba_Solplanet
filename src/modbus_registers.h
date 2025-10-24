@@ -31,7 +31,8 @@ int aiswei_find_register_index(uint32_t addr_dec);
 // Helper (internal) - you can call directly if needed
 uint16_t aiswei_dec2reg(uint32_t addr_dec);
 
-// Input registers (chapter 3.3) - prototypes
+/* Read wrappers (input & holding read requests) */
+/* Input registers (chapter 3.3) - prototypes */
 void deviceType(uint8_t slave);
 void modbusAddress(uint8_t slave);
 void serialNumber(uint8_t slave);
@@ -56,6 +57,7 @@ void inverterUphaseTemperature_C(uint8_t slave);
 void inverterVphaseTemperature_C(uint8_t slave);
 void inverterWphaseTemperature_C(uint8_t slave);
 void boostTemperature_C(uint8_t slave);
+void bidirectionalDCDCtemperature_C(uint8_t slave);
 void busVoltage_V(uint8_t slave);
 
 void pv1Voltage_V(uint8_t slave);
@@ -113,8 +115,21 @@ void batteryPower_W(uint8_t slave);
 void batteryTemperature_C(uint8_t slave);
 void batterySOC(uint8_t slave);
 void batterySOH(uint8_t slave);
+void batteryChargingCurrentLimit_A(uint8_t slave);
+void batteryDischargeCurrentLimit_A(uint8_t slave);
+void batteryEChargeToday_kWh(uint8_t slave);
+void batteryEDischargeToday_kWh(uint8_t slave);
+void eConsumptionToday_AC_kWh(uint8_t slave);
+void eGenerationToday_AC_kWh(uint8_t slave);
+void EPSLoadVoltage_V(uint8_t slave);
+void EPSLoadCurrent_A(uint8_t slave);
+void EPSLoadFrequency_Hz(uint8_t slave);
+void EPSLoadActivePower_W(uint8_t slave);
+void EPSLoadReactivePower_Var(uint8_t slave);
+void eConsumptionToday_EPS_kWh(uint8_t slave);
+void eConsumptionTotal_EPS_kWh(uint8_t slave);
 
-// Holding registers
+/* Holding registers (read wrappers) */
 void remoteSwitchCommand(uint8_t slave);
 void rtc_Year(uint8_t slave);
 void rtc_Month(uint8_t slave);
@@ -150,6 +165,7 @@ void peConnectionCheckFunction(uint8_t slave);
 void overloadFunction(uint8_t slave);
 void shadowMPPTFunction(uint8_t slave);
 
+/* 45xxx & 454xx & 455xx groups (read) */
 void gridCode(uint8_t slave);
 void overvoltageProtectionValue3_V(uint8_t slave);
 void overvoltageProtectionValue2_V(uint8_t slave);
@@ -273,6 +289,7 @@ bool writeRegisterU16(uint8_t slave, uint32_t addr_dec, uint16_t value);
 bool writeRegisterU32(uint8_t slave, uint32_t addr_dec, uint32_t value);
 
 /* Per-register write wrappers for RW holding registers (return true on request issued) */
+/* single- and multi-register writers (names correspond to read wrappers with write_ prefix) */
 bool write_remoteSwitchCommand(uint8_t slave, uint16_t value);
 bool write_rtc_Year(uint8_t slave, uint16_t value);
 bool write_rtc_Month(uint8_t slave, uint16_t value);
