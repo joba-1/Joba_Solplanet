@@ -161,10 +161,6 @@ esp32ModbusRTU modbus(&Serial1, 16);  // use Serial1 and pin 16 as RTS
 
 // helper: decode a single Modbus response and publish a human friendly payload to MQTT
 static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc, uint16_t address, uint8_t* data, size_t length) {
-    // prepare topic: joba_aiswei/modbus/<server>/<addr>
-    char topic[128];
-    snprintf(topic, sizeof(topic), "%s/modbus/%u/%u", mqttPrefix, serverAddress, address);
-
     // find matching register definition by comparing register offsets
     const RegisterInfo* ri = nullptr;
     for (size_t i = 0; i < aiswei_registers_count; ++i) {
@@ -174,6 +170,39 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
             ri = &r;
             break;
         }
+    }
+
+    // build topic using human readable slug derived from register name when available
+    char topic[128];
+    if (ri && ri->name && ri->name[0]) {
+        const char* name = ri->name;
+        char slug[64];
+        size_t si = 0;
+        bool lastUnderscore = false;
+        for (size_t i = 0; name[i] && si + 1 < sizeof(slug); ++i) {
+            unsigned char c = (unsigned char)name[i];
+            if (isalnum(c)) {
+                slug[si++] = (char)tolower(c);
+                lastUnderscore = false;
+            } else {
+                if (!lastUnderscore) {
+                    slug[si++] = '_';
+                    lastUnderscore = true;
+                }
+            }
+        }
+        // trim trailing underscore
+        while (si > 0 && slug[si-1] == '_') --si;
+        if (si == 0) {
+            // fallback to numeric address if slug empty
+            snprintf(slug, sizeof(slug), "%u", ri->addr);
+        } else {
+            slug[si] = '\0';
+        }
+        snprintf(topic, sizeof(topic), "%s/modbus/%u/%s", mqttPrefix, serverAddress, slug);
+    } else {
+        // fallback to numeric register offset (legacy)
+        snprintf(topic, sizeof(topic), "%s/modbus/%u/%u", mqttPrefix, serverAddress, address);
     }
 
     char payload[128] = {0};
