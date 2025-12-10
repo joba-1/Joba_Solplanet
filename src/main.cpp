@@ -1,8 +1,12 @@
 #include <Arduino.h>
-#include <esp32ModbusRTU.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include "modbus_registers.h"
+
+// TCP/IP headers for Modbus TCP
+#include <lwip/sockets.h>
+#include <lwip/netdb.h>
+#include <sys/socket.h>
 
 // translate AISWEI warning codes to descriptive strings
 const char* warnCodeToString(uint16_t code) {
@@ -112,12 +116,28 @@ static WiFiClient espClient;
 static PubSubClient mqttClient(espClient);
 static const char* mqttPrefix = "joba_aiswei";
 
+// Forward declaration
+static void decodeAndPublish(uint8_t serverAddress, uint8_t fc, uint16_t address, uint8_t* data, size_t length);
+
 #ifndef MQTT_SERVER
 #define MQTT_SERVER "job4"
 #endif
 #ifndef MQTT_PORT
 #define MQTT_PORT 1883
 #endif
+
+#ifndef MODBUS_TCP_HOST
+#define MODBUS_TCP_HOST "192.168.1.100"
+#endif
+#ifndef MODBUS_TCP_PORT
+#define MODBUS_TCP_PORT 502
+#endif
+
+// Modbus TCP socket and state
+static int modbusSocket = -1;
+static uint16_t transactionId = 0;
+static unsigned long lastModbusRequest = 0;
+static const unsigned long MODBUS_TIMEOUT = 5000;  // 5 seconds
 
 // helper: attempt WiFi connection only if credentials provided at build time
 static void connectWiFiIfNeeded() {
@@ -156,11 +176,147 @@ static void ensureMqttConnected() {
     }
 }
 
-// extern modbus object
-esp32ModbusRTU modbus(&Serial1, 16);  // use Serial1 and pin 16 as RTS
+// Modbus TCP connection management
+static bool connectModbusTCP() {
+    if (modbusSocket != -1) {
+        return true;  // already connected
+    }
+
+    struct hostent* host = gethostbyname(MODBUS_TCP_HOST);
+    if (!host) {
+        Serial.printf("Failed to resolve hostname: %s\n", MODBUS_TCP_HOST);
+        return false;
+    }
+
+    modbusSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (modbusSocket < 0) {
+        Serial.println("Failed to create socket");
+        return false;
+    }
+
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(MODBUS_TCP_PORT);
+    server_addr.sin_addr.s_addr = ((struct in_addr*)host->h_addr)->s_addr;
+
+    if (connect(modbusSocket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        Serial.printf("Failed to connect to Modbus TCP server %s:%d\n", MODBUS_TCP_HOST, MODBUS_TCP_PORT);
+        close(modbusSocket);
+        modbusSocket = -1;
+        return false;
+    }
+
+    Serial.printf("Connected to Modbus TCP server %s:%d\n", MODBUS_TCP_HOST, MODBUS_TCP_PORT);
+    return true;
+}
+
+// Modbus TCP request builder and sender
+static bool sendModbusTCPRequest(uint8_t unitId, uint8_t functionCode, uint16_t startAddress, uint16_t quantity) {
+    if (!connectModbusTCP()) {
+        return false;
+    }
+
+    // Build Modbus TCP frame
+    uint8_t frame[12];
+    uint16_t tid = transactionId++;
+    
+    // MBAP Header (7 bytes)
+    frame[0] = (tid >> 8) & 0xFF;           // Transaction ID (high)
+    frame[1] = tid & 0xFF;                  // Transaction ID (low)
+    frame[2] = 0x00;                        // Protocol ID (high) = 0
+    frame[3] = 0x00;                        // Protocol ID (low) = 0
+    frame[4] = 0x00;                        // Length (high) = 6 bytes
+    frame[5] = 0x06;                        // Length (low)
+    frame[6] = unitId;                      // Unit ID
+    
+    // PDU (5 bytes)
+    frame[7] = functionCode;                // Function code (0x03 = Read Holding Registers)
+    frame[8] = (startAddress >> 8) & 0xFF;  // Starting Address (high)
+    frame[9] = startAddress & 0xFF;         // Starting Address (low)
+    frame[10] = (quantity >> 8) & 0xFF;     // Quantity (high)
+    frame[11] = quantity & 0xFF;            // Quantity (low)
+
+    if (send(modbusSocket, frame, sizeof(frame), 0) < 0) {
+        Serial.println("Failed to send Modbus TCP request");
+        close(modbusSocket);
+        modbusSocket = -1;
+        return false;
+    }
+
+    Serial.printf("Sent Modbus TCP request: unitId=%u, fc=0x%02x, addr=%u, qty=%u\n", unitId, functionCode, startAddress, quantity);
+    lastModbusRequest = millis();
+    return true;
+}
+
+// Modbus TCP response parser
+static void parseModbusTCPResponse() {
+    if (modbusSocket < 0) return;
+
+    uint8_t buffer[256];
+    int bytesRead = recv(modbusSocket, buffer, sizeof(buffer), 0);
+
+    if (bytesRead < 0) {
+        Serial.println("Failed to read from socket");
+        close(modbusSocket);
+        modbusSocket = -1;
+        return;
+    }
+
+    if (bytesRead == 0) {
+        Serial.println("Connection closed by server");
+        close(modbusSocket);
+        modbusSocket = -1;
+        return;
+    }
+
+    if (bytesRead < 9) {
+        Serial.printf("Response too short: %d bytes\n", bytesRead);
+        return;
+    }
+
+    // Parse MBAP Header
+    uint16_t tid = ((uint16_t)buffer[0] << 8) | buffer[1];
+    uint16_t pid = ((uint16_t)buffer[2] << 8) | buffer[3];
+    uint16_t len = ((uint16_t)buffer[4] << 8) | buffer[5];
+    uint8_t unitId = buffer[6];
+    uint8_t fc = buffer[7];
+
+    if (pid != 0x0000) {
+        Serial.printf("Invalid Protocol ID: 0x%04x\n", pid);
+        return;
+    }
+
+    // Check for exception response (bit 7 set)
+    if (fc & 0x80) {
+        uint8_t exceptionCode = buffer[8];
+        Serial.printf("Modbus exception: fc=0x%02x, exception=0x%02x\n", fc, exceptionCode);
+        return;
+    }
+
+    // Parse PDU for function code 0x03 (Read Holding Registers)
+    if (fc == 0x03) {
+        uint8_t byteCount = buffer[8];
+        if (bytesRead < 9 + byteCount) {
+            Serial.printf("Response data incomplete\n");
+            return;
+        }
+
+        uint8_t* registerData = &buffer[9];
+        uint16_t startAddress = 0;  // We'll need to track this if needed
+        
+        Serial.printf("id 0x%02x fc 0x%02x len %u: 0x", unitId, fc, byteCount);
+        for (int i = 0; i < byteCount; ++i) {
+            Serial.printf("%02x", registerData[i]);
+        }
+        Serial.printf("\n");
+
+        // Decode and publish
+        decodeAndPublish(unitId, fc, startAddress, registerData, byteCount);
+    }
+}
 
 // helper: decode a single Modbus response and publish a human friendly payload to MQTT
-static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc, uint16_t address, uint8_t* data, size_t length) {
+static void decodeAndPublish(uint8_t serverAddress, uint8_t fc, uint16_t address, uint8_t* data, size_t length) {
     // find matching register definition by comparing register offsets
     const RegisterInfo* ri = nullptr;
     for (size_t i = 0; i < aiswei_registers_count; ++i) {
@@ -333,31 +489,16 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
 
 void setup() {
     Serial.begin(115200);
-    Serial1.begin(9600, SERIAL_8N1, 17, 4, true);  // Modbus connection
 
     connectWiFiIfNeeded();
     ensureMqttConnected();
 
-    modbus.onData([](uint8_t serverAddress, esp32Modbus::FunctionCode fc, uint16_t address, uint8_t* data, size_t length) {
-        Serial.printf("id 0x%02x fc 0x%02x len %u: 0x", serverAddress, fc, length);
-        for (size_t i = 0; i < length; ++i) {
-            Serial.printf("%02x", data[i]);
-        }
-        Serial.printf("\n");
-
-        // decode according to AISWEI register metadata and publish readable payload
-        decodeAndPublish(serverAddress, fc, address, data, length);
-    });
-
-    modbus.onError([](esp32Modbus::Error error) {
-        Serial.printf("error: 0x%02x\n\n", static_cast<uint8_t>(error));
-    });
-
-    modbus.begin();
+    Serial.println("Modbus TCP client initialized");
 }
 
 void loop() {
     static uint32_t lastMillis = 0;
+    
     // maintain MQTT connection
     if (!mqttClient.connected()) {
         ensureMqttConnected();
@@ -365,9 +506,15 @@ void loop() {
         mqttClient.loop();
     }
 
+    // Check for incoming Modbus TCP responses
+    if (modbusSocket >= 0) {
+        parseModbusTCPResponse();
+    }
+
+    // Send Modbus request every 30 seconds
     if (millis() - lastMillis > 30000) {
         lastMillis = millis();
-        Serial.print("sending Modbus request...\n");
-        modbus.readInputRegisters(0x01, 52, 2);  // read 2 registers starting at address 52 from slave 1
+        Serial.println("Sending Modbus TCP request...");
+        sendModbusTCPRequest(0x01, 0x03, 52, 2);  // Read 2 registers starting at address 52
     }
 }

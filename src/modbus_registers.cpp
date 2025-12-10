@@ -1,8 +1,12 @@
 #include "modbus_registers.h"
-#include <esp32ModbusRTU.h>
+#include <sys/socket.h>
 
-// the global modbus object is defined in main.cpp
-extern esp32ModbusRTU modbus;
+// TCP socket handle defined in main.cpp
+extern int modbusSocket;
+extern uint16_t transactionId;
+
+// Forward declarations for TCP Modbus functions
+extern bool sendModbusTCPRequest(uint8_t unitId, uint8_t functionCode, uint16_t startAddress, uint16_t quantity);
 
 // table extracted from chapter 3.3 of MB001_ASW GEN-Modbus-en_V2.1.1.
 // addr = decimal AISWEI address, length = number of 16-bit registers
@@ -293,11 +297,11 @@ static void requestAisweiRead(uint8_t slave, uint32_t addr_dec) {
     uint16_t reg = aiswei_dec2reg(addr_dec);
 
     if (addr_dec >= 40000 && addr_dec < 50000) {
-        // addresses starting with 4xxxx are holding registers
-        modbus.readHoldingRegisters(slave, reg, length);
+        // addresses starting with 4xxxx are holding registers (function code 0x03)
+        sendModbusTCPRequest(slave, 0x03, reg, length);
     } else {
-        // default to input registers for 3xxxx / others
-        modbus.readInputRegisters(slave, reg, length);
+        // default to input registers for 3xxxx (function code 0x03)
+        sendModbusTCPRequest(slave, 0x03, reg, length);
     }
 }
 
@@ -501,27 +505,26 @@ void overVoltageRecoverPowerDelayTime_s(uint8_t slave) { requestAisweiRead(slave
 void speedOfOverVoltageRecoverToPn(uint8_t slave) { requestAisweiRead(slave, 45429); }
 
 void underFrequencyIncreasePowerMode(uint8_t slave) { requestAisweiRead(slave, 45432); }
-
 void underFrequencyIncreasePowerStartFrequency_Hz(uint8_t slave) { requestAisweiRead(slave, 45433); }
-void underFrequencyIncreasePowerStopFrequency_Hz(uint8_t slave)  { requestAisweiRead(slave, 45434); }
-void underFrequencyIncreasePowerBackFrequency_Hz(uint8_t slave)  { requestAisweiRead(slave, 45435); }
-void increaseRatioOfUnderFrequencyIncreasePower(uint8_t slave)    { requestAisweiRead(slave, 45436); }
-void underFrequencyIncreasePowerDelayTime_s(uint8_t slave)       { requestAisweiRead(slave, 45437); }
-void underFrequencyRecoverPowerDelayTime_s(uint8_t slave)        { requestAisweiRead(slave, 45438); }
-void speedOfUnderFrequencyRecoverToPn(uint8_t slave)             { requestAisweiRead(slave, 45440); }
-void underFrequencyZeroPowerFrequencyPoint_Hz(uint8_t slave)     { requestAisweiRead(slave, 45441); }
+void underFrequencyIncreasePowerStopFrequency_Hz(uint8_t slave) { requestAisweiRead(slave, 45434); }
+void underFrequencyIncreasePowerBackFrequency_Hz(uint8_t slave) { requestAisweiRead(slave, 45435); }
+void increaseRatioOfUnderFrequencyIncreasePower(uint8_t slave) { requestAisweiRead(slave, 45436); }
+void underFrequencyIncreasePowerDelayTime_s(uint8_t slave) { requestAisweiRead(slave, 45437); }
+void underFrequencyRecoverPowerDelayTime_s(uint8_t slave) { requestAisweiRead(slave, 45438); }
+void speedOfUnderFrequencyRecoverToPn(uint8_t slave) { requestAisweiRead(slave, 45440); }
+void underFrequencyZeroPowerFrequencyPoint_Hz(uint8_t slave) { requestAisweiRead(slave, 45441); }
 
-void underVoltageIncreasePowerMode(uint8_t slave)                { requestAisweiRead(slave, 45443); }
+void underVoltageIncreasePowerMode(uint8_t slave) { requestAisweiRead(slave, 45443); }
 void underVoltageIncreasePowerStartVoltage_percentUn(uint8_t slave) { requestAisweiRead(slave, 45444); }
-void underVoltageIncreasePowerStopVoltage_percentUn(uint8_t slave)  { requestAisweiRead(slave, 45445); }
-void underVoltageIncreasePowerBackVoltage_percentUn(uint8_t slave)  { requestAisweiRead(slave, 45446); }
-void increaseRatioOfUnderVoltageIncreasePower(uint8_t slave)     { requestAisweiRead(slave, 45447); }
-void underVoltageIncreasePowerDelayTime_s(uint8_t slave)         { requestAisweiRead(slave, 45448); }
-void underVoltageIncreasePowerDelayTime2_s(uint8_t slave)        { requestAisweiRead(slave, 45449); }
-void speedOfUnderVoltageRecoverToPn(uint8_t slave)               { requestAisweiRead(slave, 45450); }
+void underVoltageIncreasePowerStopVoltage_percentUn(uint8_t slave) { requestAisweiRead(slave, 45445); }
+void underVoltageIncreasePowerBackVoltage_percentUn(uint8_t slave) { requestAisweiRead(slave, 45446); }
+void increaseRatioOfUnderVoltageIncreasePower(uint8_t slave) { requestAisweiRead(slave, 45447); }
+void underVoltageIncreasePowerDelayTime_s(uint8_t slave) { requestAisweiRead(slave, 45448); }
+void underVoltageIncreasePowerDelayTime2_s(uint8_t slave) { requestAisweiRead(slave, 45449); }
+void speedOfUnderVoltageRecoverToPn(uint8_t slave) { requestAisweiRead(slave, 45450); }
 
-void pav_percentPn(uint8_t slave)                                { requestAisweiRead(slave, 45451); }
-void drmsPval_percentPn(uint8_t slave)                           { requestAisweiRead(slave, 45452); }
+void pav_percentPn(uint8_t slave) { requestAisweiRead(slave, 45451); }
+void drmsPval_percentPn(uint8_t slave) { requestAisweiRead(slave, 45452); }
 
 void reactivePowerControlMode(uint8_t slave) { requestAisweiRead(slave, 45501); }
 void timeConstantOfReactivePowerCurve_s(uint8_t slave) { requestAisweiRead(slave, 45502); }
@@ -551,25 +554,60 @@ void lockOutPowerForQU_curve_percentPn(uint8_t slave) { requestAisweiRead(slave,
 void LVRT_TriggerVoltage_percentUn(uint8_t slave) { requestAisweiRead(slave, 45606); }
 void LVRT_activePowerLimitMode(uint8_t slave) { requestAisweiRead(slave, 45609); }
 
-/* --- generic write helpers --- */
+/* --- TCP Modbus write helpers --- */
+bool sendModbusTCPWriteRequest(uint8_t unitId, uint16_t registerAddress, uint16_t value) {
+    if (modbusSocket < 0) {
+        Serial.println("Socket not connected");
+        return false;
+    }
+
+    uint8_t frame[12];
+    uint16_t tid = transactionId++;
+    
+    // MBAP Header
+    frame[0] = (tid >> 8) & 0xFF;
+    frame[1] = tid & 0xFF;
+    frame[2] = 0x00;
+    frame[3] = 0x00;
+    frame[4] = 0x00;
+    frame[5] = 0x06;
+    frame[6] = unitId;
+    
+    // PDU (Function Code 0x06 - Write Single Register)
+    frame[7] = 0x06;
+    frame[8] = (registerAddress >> 8) & 0xFF;
+    frame[9] = registerAddress & 0xFF;
+    frame[10] = (value >> 8) & 0xFF;
+    frame[11] = value & 0xFF;
+
+    if (send(modbusSocket, frame, sizeof(frame), 0) < 0) {
+        Serial.println("Failed to send write request");
+        return false;
+    }
+
+    Serial.printf("Sent Modbus TCP write: reg=%u, value=%u\n", registerAddress, value);
+    return true;
+}
+
 bool writeRegisterU16(uint8_t slave, uint32_t addr_dec, uint16_t value) {
     uint16_t reg = aiswei_dec2reg(addr_dec);
-    // write single 16-bit holding register
-    // (assumes esp32ModbusRTU provides writeSingleRegister)
-    return modbus.writeSingleHoldingRegister(slave, reg, value);
+    return sendModbusTCPWriteRequest(slave, reg, value);
 }
 
 bool writeRegisterU32(uint8_t slave, uint32_t addr_dec, uint32_t value) {
+    // For U32, we need to write two consecutive registers
     uint16_t reg = aiswei_dec2reg(addr_dec);
-    uint16_t vals[2];
-    vals[0] = static_cast<uint16_t>((value >> 16) & 0xFFFF); // high word first
-    vals[1] = static_cast<uint16_t>(value & 0xFFFF);
-    // write two registers
-    return modbus.writeMultHoldingRegisters(slave, reg, 2, (uint8_t *)vals);
+    uint16_t highWord = (value >> 16) & 0xFFFF;
+    uint16_t lowWord = value & 0xFFFF;
+    
+    // Write high word first
+    if (!sendModbusTCPWriteRequest(slave, reg, highWord)) return false;
+    delay(50);
+    // Write low word second
+    return sendModbusTCPWriteRequest(slave, reg + 1, lowWord);
 }
 
 /* --- write wrappers for each RW holding register --- */
-/* simple single-register writers */
 bool write_remoteSwitchCommand(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 40201, value); }
 bool write_rtc_Year(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41001, value); }
 bool write_rtc_Month(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41002, value); }

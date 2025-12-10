@@ -1,6 +1,5 @@
 #pragma once
 #include <Arduino.h>
-#include <esp32ModbusRTU.h>
 #include <stdint.h>
 #include <stddef.h>
 
