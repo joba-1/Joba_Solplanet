@@ -115,7 +115,7 @@ const char* gridCodeToString(uint16_t code) {
 
 static WiFiClient espClient;
 static PubSubClient mqttClient(espClient);
-static const char* mqttPrefix = "joba_aiswei";
+static const char* mqttPrefix = "joba_solplanet";
 
 // Forward declaration
 static void decodeAndPublish(uint8_t serverAddress, uint8_t fc, uint16_t address, uint8_t* data, size_t length);
