@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <PubSubClient.h>
+#include <WiFiManager.h>
 #include "modbus_registers.h"
 
 // TCP/IP headers for Modbus TCP
@@ -127,7 +128,7 @@ static void decodeAndPublish(uint8_t serverAddress, uint8_t fc, uint16_t address
 #endif
 
 #ifndef MODBUS_TCP_HOST
-#define MODBUS_TCP_HOST "192.168.1.100"
+#define MODBUS_TCP_HOST "192.168.1.191"
 #endif
 #ifndef MODBUS_TCP_PORT
 #define MODBUS_TCP_PORT 502
@@ -139,36 +140,40 @@ static uint16_t transactionId = 0;
 static unsigned long lastModbusRequest = 0;
 static const unsigned long MODBUS_TIMEOUT = 5000;  // 5 seconds
 
-// helper: attempt WiFi connection only if credentials provided at build time
-static void connectWiFiIfNeeded() {
-#ifdef WIFI_SSID
-    if (WiFi.status() == WL_CONNECTED) return;
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.printf("Connecting to WiFi '%s' ", WIFI_SSID);
-    uint32_t start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-        delay(500);
-        Serial.print(".");
-    }
-    Serial.println();
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+// WiFiManager instance
+static WiFiManager wm;
+
+// helper: setup WiFi using WiFiManager
+static void setupWiFi() {
+    wm.setConfigPortalTimeout(120);  // 2 minutes to configure
+    wm.setConnectTimeout(20);         // 20 seconds to connect
+    
+    // Try to connect to saved WiFi, or start AP if it fails
+    if (!wm.autoConnect("Joba_Solplanet", "Solplanet")) {
+        Serial.println("Failed to connect WiFi. Please configure via AP.");
+        // Device will remain in AP mode waiting for configuration
     } else {
-        Serial.println("WiFi not connected (timed out)");
+        Serial.printf("WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
     }
-#else
-    Serial.println("WIFI_SSID not defined at build time — assuming network already configured.");
-#endif
 }
 
 static void ensureMqttConnected() {
     if (mqttClient.connected()) return;
+    
+    // Check if WiFi is connected first
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi not connected, skipping MQTT");
+        return;
+    }
+    
     mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
     Serial.printf("Connecting to MQTT %s:%d ...\n", MQTT_SERVER, MQTT_PORT);
+    
     // client id: joba_aiswei + last 4 of chip id
     uint32_t chipid = (uint32_t)ESP.getEfuseMac();
     char clientId[40];
     snprintf(clientId, sizeof(clientId), "%s-%08X", mqttPrefix, (unsigned int)(chipid & 0xFFFFFFFF));
+    
     if (mqttClient.connect(clientId)) {
         Serial.println("MQTT connected");
     } else {
@@ -302,7 +307,7 @@ static void parseModbusTCPResponse() {
         }
 
         uint8_t* registerData = &buffer[9];
-        uint16_t startAddress = 0;  // We'll need to track this if needed
+        uint16_t startAddress = 0;
         
         Serial.printf("id 0x%02x fc 0x%02x len %u: 0x", unitId, fc, byteCount);
         for (int i = 0; i < byteCount; ++i) {
@@ -489,8 +494,14 @@ static void decodeAndPublish(uint8_t serverAddress, uint8_t fc, uint16_t address
 
 void setup() {
     Serial.begin(115200);
+    delay(1000);
 
-    connectWiFiIfNeeded();
+    Serial.println("\n\nStarting Joba Solplanet...");
+
+    // Setup WiFi with WiFiManager
+    setupWiFi();
+    
+    // Setup MQTT
     ensureMqttConnected();
 
     Serial.println("Modbus TCP client initialized");
@@ -498,6 +509,16 @@ void setup() {
 
 void loop() {
     static uint32_t lastMillis = 0;
+    static uint32_t lastWiFiCheck = 0;
+    
+    // Check WiFi status periodically
+    if (millis() - lastWiFiCheck > 10000) {
+        lastWiFiCheck = millis();
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("WiFi disconnected, attempting reconnect...");
+            WiFi.reconnect();
+        }
+    }
     
     // maintain MQTT connection
     if (!mqttClient.connected()) {
