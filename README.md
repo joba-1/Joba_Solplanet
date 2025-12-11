@@ -1,17 +1,18 @@
 # Joba_Solplanet
 
-This project is designed for the ESP32 microcontroller and utilizes a Modbus library for RS485 communication and PubSub library to publish results on an mqtt broker. 
-It implements communication with AISWEI Inverters (aka Solplanet) as described in api reference document 2.1.1.
+This project was designed for the ESP32 microcontroller to utilizes a Modbus library for RS485 communication and PubSub library to publish results on an mqtt broker. 
+It now implements communication with AISWEI Inverters (aka Solplanet) via ModbusTCP as described in api reference document 2.1.1.
 
 ## Project Structure
 
-- **platformio.ini**: Configuration file for PlatformIO, specifying environment settings and libraries.
+- **platformio.ini**: Configuration file for PlatformIO, specifying target settings, defines and libraries.
+- **CMakeLists.txt**: Configuration file for CMake on Linux, specifying defines and libraries.
 - **src/**: Contains the source code files.
   - **main.cpp**: The main entry point of the application, initializing the ESP32 and handling Modbus communication.
   - **modbus_registers.h**: datatypes and prototypes for the Solplanet inverter modbus interface.
   - **modbus_registers.cpp**: implements the Solplanet inverter modbus interface functions.
 
-## Setup Instructions
+## PlatformIO Setup Instructions (not relevant, use linux cmake)
 
 1. **Install PlatformIO**: Ensure you have PlatformIO installed in your development environment (I use the VS Code extension).
 2. **Clone the Repository**: Clone this project to your local machine.
@@ -21,18 +22,17 @@ It implements communication with AISWEI Inverters (aka Solplanet) as described i
 
 ## Usage
 
-After uploading the code to the ESP32, the device will start receiving modbus responses over RS485.
+After compiling code for Linux, the program will start receiving modbus responses over TCP.
 The responses are then published on an mqtt broker.
 
 ## TODO
 
-* The ESP32 should issue modbus commands via functions from modbus_registers.h
-* As a first step implement a web interface to select the function and enter parameters 
-* Also useful: subscribe on a command topic receiving function and parameters to execute.
+* Useful for testing: subscribe on a command topic receiving function and parameters to execute.
+* Only on request is done. After processing the first result nothing happens (should send request in a loop)
+* Numbers are always zero (correct number of bytes, all zero), Strings work
 Finally: 
 * implement intelligent logic to operate and monitor the inverter automatically
 * For monitoring poll status and write to influxdb (visualize with grafana)
-
 
 ## License
 
