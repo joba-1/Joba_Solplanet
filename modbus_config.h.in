@@ -1,0 +1,3 @@
+#define MODBUS_SERVER "192.168.1.191"
+#define MODBUS_PORT 502
+#define MODBUS_UNIT_ID 1

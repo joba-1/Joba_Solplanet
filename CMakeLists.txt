@@ -24,4 +24,7 @@ target_link_libraries(joba_solplanet PRIVATE
 )
 
 # Include directories
+set(CMAKE_INCLUDE_CURRENT_DIR TRUE)
 target_include_directories(joba_solplanet PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+configure_file(mqtt_config.h.in mqtt_config.h)
+configure_file(modbus_config.h.in modbus_config.h)
