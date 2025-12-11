@@ -1,13 +1,45 @@
-#include <Arduino.h>
-#include <WiFi.h>
-#include <PubSubClient.h>
-#include <WiFiManager.h>
+#include <iostream>
+#include <string>
+#include <cstring>
+#include <cstdint>
+#include <cstdlib>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <thread>
+#include <chrono>
+#include <atomic>
+#include "mqtt/client.h"
+
 #include "modbus_registers.h"
 
-// TCP/IP headers for Modbus TCP
-#include <lwip/sockets.h>
-#include <lwip/netdb.h>
-#include <sys/socket.h>
+// Logging helper
+#define LOG(fmt, ...) printf("[%s] " fmt "\n", __FUNCTION__, ##__VA_ARGS__)
+
+// MQTT configuration
+#ifndef MQTT_SERVER
+#define MQTT_SERVER "job4"
+#endif
+#ifndef MQTT_PORT
+#define MQTT_PORT 1883
+#endif
+
+// Modbus TCP configuration
+#ifndef MODBUS_TCP_HOST
+#define MODBUS_TCP_HOST "192.168.1.191"
+#endif
+#ifndef MODBUS_TCP_PORT
+#define MODBUS_TCP_PORT 502
+#endif
+
+// Global state
+int modbusSocket = -1;
+uint16_t transactionId = 0;
+static const char* mqttPrefix = "joba_solplanet";
+static mqtt::client* mqttClient = nullptr;
+static std::atomic<bool> running(true);
 
 // translate AISWEI warning codes to descriptive strings
 const char* warnCodeToString(uint16_t code) {
@@ -113,73 +145,8 @@ const char* gridCodeToString(uint16_t code) {
     }
 }
 
-static WiFiClient espClient;
-static PubSubClient mqttClient(espClient);
-static const char* mqttPrefix = "joba_solplanet";
-
 // Forward declaration
 static void decodeAndPublish(uint8_t serverAddress, uint8_t fc, uint16_t address, uint8_t* data, size_t length);
-
-#ifndef MQTT_SERVER
-#define MQTT_SERVER "job4"
-#endif
-#ifndef MQTT_PORT
-#define MQTT_PORT 1883
-#endif
-
-#ifndef MODBUS_TCP_HOST
-#define MODBUS_TCP_HOST "192.168.1.191"
-#endif
-#ifndef MODBUS_TCP_PORT
-#define MODBUS_TCP_PORT 502
-#endif
-
-// Modbus TCP socket and state
-static int modbusSocket = -1;
-static uint16_t transactionId = 0;
-static unsigned long lastModbusRequest = 0;
-static const unsigned long MODBUS_TIMEOUT = 5000;  // 5 seconds
-
-// WiFiManager instance
-static WiFiManager wm;
-
-// helper: setup WiFi using WiFiManager
-static void setupWiFi() {
-    wm.setConfigPortalTimeout(120);  // 2 minutes to configure
-    wm.setConnectTimeout(20);         // 20 seconds to connect
-    
-    // Try to connect to saved WiFi, or start AP if it fails
-    if (!wm.autoConnect("Joba_Solplanet", "Solplanet")) {
-        Serial.println("Failed to connect WiFi. Please configure via AP.");
-        // Device will remain in AP mode waiting for configuration
-    } else {
-        Serial.printf("WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
-    }
-}
-
-static void ensureMqttConnected() {
-    if (mqttClient.connected()) return;
-    
-    // Check if WiFi is connected first
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("WiFi not connected, skipping MQTT");
-        return;
-    }
-    
-    mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
-    Serial.printf("Connecting to MQTT %s:%d ...\n", MQTT_SERVER, MQTT_PORT);
-    
-    // client id: joba_aiswei + last 4 of chip id
-    uint32_t chipid = (uint32_t)ESP.getEfuseMac();
-    char clientId[40];
-    snprintf(clientId, sizeof(clientId), "%s-%08X", mqttPrefix, (unsigned int)(chipid & 0xFFFFFFFF));
-    
-    if (mqttClient.connect(clientId)) {
-        Serial.println("MQTT connected");
-    } else {
-        Serial.printf("MQTT connect failed, rc=%d\n", mqttClient.state());
-    }
-}
 
 // Modbus TCP connection management
 static bool connectModbusTCP() {
@@ -189,13 +156,13 @@ static bool connectModbusTCP() {
 
     struct hostent* host = gethostbyname(MODBUS_TCP_HOST);
     if (!host) {
-        Serial.printf("Failed to resolve hostname: %s\n", MODBUS_TCP_HOST);
+        LOG("Failed to resolve hostname: %s", MODBUS_TCP_HOST);
         return false;
     }
 
     modbusSocket = socket(AF_INET, SOCK_STREAM, 0);
     if (modbusSocket < 0) {
-        Serial.println("Failed to create socket");
+        LOG("Failed to create socket");
         return false;
     }
 
@@ -205,18 +172,18 @@ static bool connectModbusTCP() {
     server_addr.sin_addr.s_addr = ((struct in_addr*)host->h_addr)->s_addr;
 
     if (connect(modbusSocket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        Serial.printf("Failed to connect to Modbus TCP server %s:%d\n", MODBUS_TCP_HOST, MODBUS_TCP_PORT);
+        LOG("Failed to connect to Modbus TCP server %s:%d", MODBUS_TCP_HOST, MODBUS_TCP_PORT);
         close(modbusSocket);
         modbusSocket = -1;
         return false;
     }
 
-    Serial.printf("Connected to Modbus TCP server %s:%d\n", MODBUS_TCP_HOST, MODBUS_TCP_PORT);
+    LOG("Connected to Modbus TCP server %s:%d", MODBUS_TCP_HOST, MODBUS_TCP_PORT);
     return true;
 }
 
 // Modbus TCP request builder and sender
-static bool sendModbusTCPRequest(uint8_t unitId, uint8_t functionCode, uint16_t startAddress, uint16_t quantity) {
+bool sendModbusTCPRequest(uint8_t unitId, uint8_t functionCode, uint16_t startAddress, uint16_t quantity) {
     if (!connectModbusTCP()) {
         return false;
     }
@@ -242,14 +209,13 @@ static bool sendModbusTCPRequest(uint8_t unitId, uint8_t functionCode, uint16_t 
     frame[11] = quantity & 0xFF;            // Quantity (low)
 
     if (send(modbusSocket, frame, sizeof(frame), 0) < 0) {
-        Serial.println("Failed to send Modbus TCP request");
+        LOG("Failed to send Modbus TCP request");
         close(modbusSocket);
         modbusSocket = -1;
         return false;
     }
 
-    Serial.printf("Sent Modbus TCP request: unitId=%u, fc=0x%02x, addr=%u, qty=%u\n", unitId, functionCode, startAddress, quantity);
-    lastModbusRequest = millis();
+    LOG("Sent Modbus TCP request: unitId=%u, fc=0x%02x, addr=%u, qty=%u", unitId, functionCode, startAddress, quantity);
     return true;
 }
 
@@ -261,21 +227,21 @@ static void parseModbusTCPResponse() {
     int bytesRead = recv(modbusSocket, buffer, sizeof(buffer), 0);
 
     if (bytesRead < 0) {
-        Serial.println("Failed to read from socket");
+        LOG("Failed to read from socket");
         close(modbusSocket);
         modbusSocket = -1;
         return;
     }
 
     if (bytesRead == 0) {
-        Serial.println("Connection closed by server");
+        LOG("Connection closed by server");
         close(modbusSocket);
         modbusSocket = -1;
         return;
     }
 
     if (bytesRead < 9) {
-        Serial.printf("Response too short: %d bytes\n", bytesRead);
+        LOG("Response too short: %d bytes", bytesRead);
         return;
     }
 
@@ -287,14 +253,14 @@ static void parseModbusTCPResponse() {
     uint8_t fc = buffer[7];
 
     if (pid != 0x0000) {
-        Serial.printf("Invalid Protocol ID: 0x%04x\n", pid);
+        LOG("Invalid Protocol ID: 0x%04x", pid);
         return;
     }
 
     // Check for exception response (bit 7 set)
     if (fc & 0x80) {
         uint8_t exceptionCode = buffer[8];
-        Serial.printf("Modbus exception: fc=0x%02x, exception=0x%02x\n", fc, exceptionCode);
+        LOG("Modbus exception: fc=0x%02x, exception=0x%02x", fc, exceptionCode);
         return;
     }
 
@@ -302,18 +268,18 @@ static void parseModbusTCPResponse() {
     if (fc == 0x03) {
         uint8_t byteCount = buffer[8];
         if (bytesRead < 9 + byteCount) {
-            Serial.printf("Response data incomplete\n");
+            LOG("Response data incomplete");
             return;
         }
 
         uint8_t* registerData = &buffer[9];
         uint16_t startAddress = 0;
         
-        Serial.printf("id 0x%02x fc 0x%02x len %u: 0x", unitId, fc, byteCount);
+        printf("[parseModbusTCPResponse] id 0x%02x fc 0x%02x len %u: 0x", unitId, fc, byteCount);
         for (int i = 0; i < byteCount; ++i) {
-            Serial.printf("%02x", registerData[i]);
+            printf("%02x", registerData[i]);
         }
-        Serial.printf("\n");
+        printf("\n");
 
         // Decode and publish
         decodeAndPublish(unitId, fc, startAddress, registerData, byteCount);
@@ -375,9 +341,11 @@ static void decodeAndPublish(uint8_t serverAddress, uint8_t fc, uint16_t address
             for (int i = 0; i < 4; ++i) tmp[i] = data[3 - i];
             float value;
             memcpy(&value, tmp, sizeof(value));
-            snprintf(payload, sizeof(payload), "%.3f", value);
-            if (mqttClient.connected()) mqttClient.publish(topic, payload);
-            Serial.printf("decoded float: %s\n\n", payload);
+            size_t payload_len = snprintf(payload, sizeof(payload), "%.3f", value);
+            if (mqttClient && mqttClient->is_connected()) {
+                mqttClient->publish(topic, payload, payload_len);
+            }
+            LOG("decoded float: %s", payload);
             return;
         }
 
@@ -387,8 +355,10 @@ static void decodeAndPublish(uint8_t serverAddress, uint8_t fc, uint16_t address
             pos += snprintf(payload + pos, sizeof(payload) - pos, "%02x", data[i]);
         }
         payload[pos] = '\0';
-        if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        Serial.printf("no register meta -> hex: %s\n\n", payload);
+        if (mqttClient && mqttClient->is_connected()) {
+            mqttClient->publish(topic, payload, pos);
+        }
+        LOG("no register meta -> hex: %s", payload);
         return;
     }
 
@@ -425,8 +395,10 @@ static void decodeAndPublish(uint8_t serverAddress, uint8_t fc, uint16_t address
         }
         payload[pos] = '\0';
         if (payload[0] == '\0') strncpy(payload, "<empty>", sizeof(payload));
-        if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        Serial.printf("%s -> %s\n\n", ri->name, payload);
+        if (mqttClient && mqttClient->is_connected()) {
+            mqttClient->publish(topic, payload, pos);
+        }
+        LOG("%s -> %s", ri->name, payload);
         return;
     }
 
@@ -458,8 +430,10 @@ static void decodeAndPublish(uint8_t serverAddress, uint8_t fc, uint16_t address
                 snprintf(payload, sizeof(payload), "0x%04x", raw);
             }
         }
-        if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        Serial.printf("%s -> %s\n\n", ri->name, payload);
+        if (mqttClient && mqttClient->is_connected()) {
+            mqttClient->publish(topic, payload, strlen(payload));
+        }
+        LOG("%s -> %s", ri->name, payload);
         return;
     }
 
@@ -475,8 +449,10 @@ static void decodeAndPublish(uint8_t serverAddress, uint8_t fc, uint16_t address
                 fmt_with_gain(raw);
             }
         }
-        if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        Serial.printf("%s -> %s\n\n", ri->name, payload);
+        if (mqttClient && mqttClient->is_connected()) {
+            mqttClient->publish(topic, payload, strlen(payload));
+        }
+        LOG("%s -> %s", ri->name, payload);
         return;
     }
 
@@ -487,55 +463,88 @@ static void decodeAndPublish(uint8_t serverAddress, uint8_t fc, uint16_t address
             pos += snprintf(payload + pos, sizeof(payload) - pos, "%02x", data[i]);
         }
         payload[pos] = '\0';
-        if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        Serial.printf("%s -> %s (hex)\n\n", ri->name, payload);
+        if (mqttClient && mqttClient->is_connected()) {
+            mqttClient->publish(topic, payload, pos);
+        }
+        LOG("%s -> %s (hex)", ri->name, payload);
     }
 }
 
-void setup() {
-    Serial.begin(115200);
-    delay(1000);
-
-    Serial.println("\n\nStarting Joba Solplanet...");
-
-    // Setup WiFi with WiFiManager
-    setupWiFi();
-    
-    // Setup MQTT
-    ensureMqttConnected();
-
-    Serial.println("Modbus TCP client initialized");
+// MQTT polling thread
+static void mqttThread() {
+    try {
+        auto opts = mqtt::connect_options_builder()
+                        .keep_alive_interval(std::chrono::seconds(60))
+                        .clean_session(false)
+                        .automatic_reconnect(true)
+                        .finalize();
+        
+        mqttClient = new mqtt::client(
+            std::string("tcp://") + MQTT_SERVER + ":" + std::to_string(MQTT_PORT),
+            "joba_solplanet_linux"
+        );
+        
+        LOG("Connecting to MQTT %s:%d", MQTT_SERVER, MQTT_PORT);
+        mqttClient->connect(opts);
+        LOG("MQTT connected");
+        
+    } catch (const mqtt::exception& exc) {
+        LOG("MQTT connection failed: %s", exc.what());
+    }
 }
 
-void loop() {
-    static uint32_t lastMillis = 0;
-    static uint32_t lastWiFiCheck = 0;
+// Modbus polling thread
+static void modbusThread() {
+    int pollCount = 0;
+    while (running) {
+        if (pollCount++ % 30 == 0) {  // Every 30 seconds
+            LOG("Sending Modbus TCP request...");
+            sendModbusTCPRequest(0x01, 0x03, 52, 2);  // Read 2 registers starting at address 52
+        }
+        
+        // Try to parse response
+        parseModbusTCPResponse();
+        
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+int main(int argc, char** argv) {
+    std::cout << "Starting Joba Solplanet (Linux)..." << std::endl;
+
+    // Start MQTT thread
+    std::thread mqtt_th(mqttThread);
+    mqtt_th.detach();
+
+    // Start Modbus polling thread
+    std::thread modbus_th(modbusThread);
+
+    // Main thread: handle signals/commands
+    std::string command;
+    std::cout << "Type 'quit' to exit..." << std::endl;
     
-    // Check WiFi status periodically
-    if (millis() - lastWiFiCheck > 10000) {
-        lastWiFiCheck = millis();
-        if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("WiFi disconnected, attempting reconnect...");
-            WiFi.reconnect();
+    while (running && std::getline(std::cin, command)) {
+        if (command == "quit" || command == "exit") {
+            running = false;
+            break;
         }
     }
+
+    // Cleanup
+    running = false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
     
-    // maintain MQTT connection
-    if (!mqttClient.connected()) {
-        ensureMqttConnected();
-    } else {
-        mqttClient.loop();
+    if (modbusSocket != -1) {
+        close(modbusSocket);
+    }
+    
+    if (mqttClient) {
+        try {
+            mqttClient->disconnect();
+            delete mqttClient;
+        } catch (...) {}
     }
 
-    // Check for incoming Modbus TCP responses
-    if (modbusSocket >= 0) {
-        parseModbusTCPResponse();
-    }
-
-    // Send Modbus request every 30 seconds
-    if (millis() - lastMillis > 30000) {
-        lastMillis = millis();
-        Serial.println("Sending Modbus TCP request...");
-        sendModbusTCPRequest(0x01, 0x03, 52, 2);  // Read 2 registers starting at address 52
-    }
+    std::cout << "Shutdown complete." << std::endl;
+    return 0;
 }

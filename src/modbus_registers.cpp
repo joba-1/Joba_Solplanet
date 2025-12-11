@@ -1,5 +1,7 @@
 #include "modbus_registers.h"
 #include <sys/socket.h>
+#include <unistd.h>
+#include <stdio.h>
 
 // TCP socket handle defined in main.cpp
 extern int modbusSocket;
@@ -557,7 +559,7 @@ void LVRT_activePowerLimitMode(uint8_t slave) { requestAisweiRead(slave, 45609);
 /* --- TCP Modbus write helpers --- */
 bool sendModbusTCPWriteRequest(uint8_t unitId, uint16_t registerAddress, uint16_t value) {
     if (modbusSocket < 0) {
-        Serial.println("Socket not connected");
+        printf("Socket not connected\n");
         return false;
     }
 
@@ -581,11 +583,11 @@ bool sendModbusTCPWriteRequest(uint8_t unitId, uint16_t registerAddress, uint16_
     frame[11] = value & 0xFF;
 
     if (send(modbusSocket, frame, sizeof(frame), 0) < 0) {
-        Serial.println("Failed to send write request");
+        printf("Failed to send write request\n");
         return false;
     }
 
-    Serial.printf("Sent Modbus TCP write: reg=%u, value=%u\n", registerAddress, value);
+    printf("Sent Modbus TCP write: reg=%u, value=%u\n", registerAddress, value);
     return true;
 }
 
@@ -602,7 +604,7 @@ bool writeRegisterU32(uint8_t slave, uint32_t addr_dec, uint32_t value) {
     
     // Write high word first
     if (!sendModbusTCPWriteRequest(slave, reg, highWord)) return false;
-    delay(50);
+    usleep(50000);
     // Write low word second
     return sendModbusTCPWriteRequest(slave, reg + 1, lowWord);
 }
