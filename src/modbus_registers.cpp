@@ -302,7 +302,7 @@ static void requestAisweiRead(uint8_t slave, uint32_t addr_dec) {
         // addresses starting with 4xxxx are holding registers (function code 0x03)
         sendModbusTCPRequest(slave, 0x03, reg, length);
     } else {
-        // default to input registers for 3xxxx (function code 0x03)
+        // default to input registers for 3xxxx (function code 0x04)
         sendModbusTCPRequest(slave, 0x03, reg, length);
     }
 }

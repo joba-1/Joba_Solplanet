@@ -497,9 +497,11 @@ static void mqttThread() {
 static void modbusThread() {
     int pollCount = 0;
     while (running) {
-        if (pollCount++ % 30 == 0) {  // Every 30 seconds
+        if (++pollCount % 10 == 0) {  // Every 1 seconds
             LOG("Sending Modbus TCP request...");
-            sendModbusTCPRequest(0x01, 0x03, 52, 2);  // Read 2 registers starting at address 52
+            // sendModbusTCPRequest(0x01, 0x03, 52, 2);  // Read 2 registers starting at address 52
+            // currentPowerValueOfSmartMeter_W(1);
+            sendModbusTCPRequest(1, 0x03, 31001, 100);
         }
         
         // Try to parse response
