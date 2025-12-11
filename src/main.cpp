@@ -4,10 +4,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <unistd.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
 #include <thread>
 #include <chrono>
 #include <atomic>
@@ -19,27 +15,15 @@
 #define LOG(fmt, ...) printf("[%s] " fmt "\n", __FUNCTION__, ##__VA_ARGS__)
 
 // MQTT configuration
-#ifndef MQTT_SERVER
-#define MQTT_SERVER "job4"
-#endif
-#ifndef MQTT_PORT
-#define MQTT_PORT 1883
-#endif
+#include "mqtt_config.h"
 
 // Modbus TCP configuration
-#ifndef MODBUS_TCP_HOST
-#define MODBUS_TCP_HOST "192.168.1.191"
-#endif
-#ifndef MODBUS_TCP_PORT
-#define MODBUS_TCP_PORT 502
-#endif
+#include "modbus_config.h"
 
-// Global state
-int modbusSocket = -1;
-uint16_t transactionId = 0;
-static const char* mqttPrefix = "joba_solplanet";
+static const char* mqttPrefix = MQTT_TOPIC_PREFIX;
 static mqtt::client* mqttClient = nullptr;
 static std::atomic<bool> running(true);
+
 
 // translate AISWEI warning codes to descriptive strings
 const char* warnCodeToString(uint16_t code) {
@@ -145,155 +129,14 @@ const char* gridCodeToString(uint16_t code) {
     }
 }
 
-// Forward declaration
-static void decodeAndPublish(uint8_t serverAddress, uint8_t fc, uint16_t address, uint8_t* data, size_t length);
-
-// Modbus TCP connection management
-static bool connectModbusTCP() {
-    if (modbusSocket != -1) {
-        return true;  // already connected
-    }
-
-    struct hostent* host = gethostbyname(MODBUS_TCP_HOST);
-    if (!host) {
-        LOG("Failed to resolve hostname: %s", MODBUS_TCP_HOST);
-        return false;
-    }
-
-    modbusSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (modbusSocket < 0) {
-        LOG("Failed to create socket");
-        return false;
-    }
-
-    struct sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(MODBUS_TCP_PORT);
-    server_addr.sin_addr.s_addr = ((struct in_addr*)host->h_addr)->s_addr;
-
-    if (connect(modbusSocket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
-        LOG("Failed to connect to Modbus TCP server %s:%d", MODBUS_TCP_HOST, MODBUS_TCP_PORT);
-        close(modbusSocket);
-        modbusSocket = -1;
-        return false;
-    }
-
-    LOG("Connected to Modbus TCP server %s:%d", MODBUS_TCP_HOST, MODBUS_TCP_PORT);
-    return true;
-}
-
-// Modbus TCP request builder and sender
-bool sendModbusTCPRequest(uint8_t unitId, uint8_t functionCode, uint16_t startAddress, uint16_t quantity) {
-    if (!connectModbusTCP()) {
-        return false;
-    }
-
-    // Build Modbus TCP frame
-    uint8_t frame[12];
-    uint16_t tid = transactionId++;
-    
-    // MBAP Header (7 bytes)
-    frame[0] = (tid >> 8) & 0xFF;           // Transaction ID (high)
-    frame[1] = tid & 0xFF;                  // Transaction ID (low)
-    frame[2] = 0x00;                        // Protocol ID (high) = 0
-    frame[3] = 0x00;                        // Protocol ID (low) = 0
-    frame[4] = 0x00;                        // Length (high) = 6 bytes
-    frame[5] = 0x06;                        // Length (low)
-    frame[6] = unitId;                      // Unit ID
-    
-    // PDU (5 bytes)
-    frame[7] = functionCode;                // Function code (0x03 = Read Holding Registers)
-    frame[8] = (startAddress >> 8) & 0xFF;  // Starting Address (high)
-    frame[9] = startAddress & 0xFF;         // Starting Address (low)
-    frame[10] = (quantity >> 8) & 0xFF;     // Quantity (high)
-    frame[11] = quantity & 0xFF;            // Quantity (low)
-
-    if (send(modbusSocket, frame, sizeof(frame), 0) < 0) {
-        LOG("Failed to send Modbus TCP request");
-        close(modbusSocket);
-        modbusSocket = -1;
-        return false;
-    }
-
-    LOG("Sent Modbus TCP request: unitId=%u, fc=0x%02x, addr=%u, qty=%u", unitId, functionCode, startAddress, quantity);
-    return true;
-}
-
-// Modbus TCP response parser
-static void parseModbusTCPResponse() {
-    if (modbusSocket < 0) return;
-
-    uint8_t buffer[256];
-    int bytesRead = recv(modbusSocket, buffer, sizeof(buffer), 0);
-
-    if (bytesRead < 0) {
-        LOG("Failed to read from socket");
-        close(modbusSocket);
-        modbusSocket = -1;
-        return;
-    }
-
-    if (bytesRead == 0) {
-        LOG("Connection closed by server");
-        close(modbusSocket);
-        modbusSocket = -1;
-        return;
-    }
-
-    if (bytesRead < 9) {
-        LOG("Response too short: %d bytes", bytesRead);
-        return;
-    }
-
-    // Parse MBAP Header
-    uint16_t tid = ((uint16_t)buffer[0] << 8) | buffer[1];
-    uint16_t pid = ((uint16_t)buffer[2] << 8) | buffer[3];
-    uint16_t len = ((uint16_t)buffer[4] << 8) | buffer[5];
-    uint8_t unitId = buffer[6];
-    uint8_t fc = buffer[7];
-
-    if (pid != 0x0000) {
-        LOG("Invalid Protocol ID: 0x%04x", pid);
-        return;
-    }
-
-    // Check for exception response (bit 7 set)
-    if (fc & 0x80) {
-        uint8_t exceptionCode = buffer[8];
-        LOG("Modbus exception: fc=0x%02x, exception=0x%02x", fc, exceptionCode);
-        return;
-    }
-
-    // Parse PDU for function code 0x03 (Read Holding Registers)
-    if (fc == 0x03) {
-        uint8_t byteCount = buffer[8];
-        if (bytesRead < 9 + byteCount) {
-            LOG("Response data incomplete");
-            return;
-        }
-
-        uint8_t* registerData = &buffer[9];
-        uint16_t startAddress = 0;
-        
-        printf("[parseModbusTCPResponse] id 0x%02x fc 0x%02x len %u: 0x", unitId, fc, byteCount);
-        for (int i = 0; i < byteCount; ++i) {
-            printf("%02x", registerData[i]);
-        }
-        printf("\n");
-
-        // Decode and publish
-        decodeAndPublish(unitId, fc, startAddress, registerData, byteCount);
-    }
-}
-
 // helper: decode a single Modbus response and publish a human friendly payload to MQTT
-static void decodeAndPublish(uint8_t serverAddress, uint8_t fc, uint16_t address, uint8_t* data, size_t length) {
+void decodeAndPublish(uint8_t serverAddress, uint16_t reg, uint8_t* data, size_t length) {
     // find matching register definition by comparing register offsets
     const RegisterInfo* ri = nullptr;
     for (size_t i = 0; i < aiswei_registers_count; ++i) {
         const RegisterInfo &r = aiswei_registers[i];
         uint16_t regOff = aiswei_dec2reg(r.addr);
-        if (address >= regOff && address < regOff + r.length) {
+        if (reg >= regOff && reg < regOff + r.length) {
             ri = &r;
             break;
         }
@@ -329,7 +172,7 @@ static void decodeAndPublish(uint8_t serverAddress, uint8_t fc, uint16_t address
         snprintf(topic, sizeof(topic), "%s/modbus/%u/%s", mqttPrefix, serverAddress, slug);
     } else {
         // fallback to numeric register offset (legacy)
-        snprintf(topic, sizeof(topic), "%s/modbus/%u/%u", mqttPrefix, serverAddress, address);
+        snprintf(topic, sizeof(topic), "%s/modbus/%u/%u", mqttPrefix, serverAddress, reg);
     }
 
     char payload[128] = {0};
@@ -480,8 +323,7 @@ static void mqttThread() {
                         .finalize();
         
         mqttClient = new mqtt::client(
-            std::string("tcp://") + MQTT_SERVER + ":" + std::to_string(MQTT_PORT),
-            "joba_solplanet_linux"
+            std::string("tcp://") + MQTT_SERVER + ":" + std::to_string(MQTT_PORT), MQTT_TOPIC_PREFIX
         );
         
         LOG("Connecting to MQTT %s:%d", MQTT_SERVER, MQTT_PORT);
@@ -499,9 +341,14 @@ static void modbusThread() {
     while (running) {
         if (++pollCount % 10 == 0) {  // Every 1 seconds
             LOG("Sending Modbus TCP request...");
-            // sendModbusTCPRequest(0x01, 0x03, 52, 2);  // Read 2 registers starting at address 52
-            // currentPowerValueOfSmartMeter_W(1);
-            sendModbusTCPRequest(1, 0x03, 31001, 100);
+            // TODO check currentPowerValueOfSmartMeter_W(MODBUS_UNIT_ID);
+            // serialNumber(MODBUS_UNIT_ID);
+            // manufacturerName(MODBUS_UNIT_ID);
+            // brandName(MODBUS_UNIT_ID);
+            // TODO check batterySOC(MODBUS_UNIT_ID);
+            // TODO check batteryVoltage_V(MODBUS_UNIT_ID);
+            // TODO check Dword batteryEChargeToday_kWh(MODBUS_UNIT_ID);
+            // numbers are always zero (matching byte results), strings work
         }
         
         // Try to parse response
@@ -512,7 +359,7 @@ static void modbusThread() {
 }
 
 int main(int argc, char** argv) {
-    std::cout << "Starting Joba Solplanet (Linux)..." << std::endl;
+    std::cout << "Starting Joba Solplanet Gateway..." << std::endl;
 
     // Start MQTT thread
     std::thread mqtt_th(mqttThread);
@@ -536,10 +383,8 @@ int main(int argc, char** argv) {
     running = false;
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     
-    if (modbusSocket != -1) {
-        close(modbusSocket);
-    }
-    
+    cleanupModbusTCP();
+
     if (mqttClient) {
         try {
             mqttClient->disconnect();
