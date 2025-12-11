@@ -1,6 +1,6 @@
 # Joba_Solplanet
 
-This project is designed for the ESP32 microcontroller and utilizes a Modbus library for RS485 communication and PubSub library to publish results on an mqtt broker. 
+This project was designed for the ESP32 microcontroller and utilizes a ModbusRTU library for RS485 communication and PubSub library to publish results on an mqtt broker. Now it has branches for ModbusTCP and Linux. State is alpha, meaning on linux I get results on requests for id=1 and fc=3 but they are probably mostly wrong. 
 It implements communication with AISWEI Inverters (aka Solplanet) as described in api reference document 2.1.1.
 
 ## Project Structure
