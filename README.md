@@ -28,7 +28,6 @@ The responses are then published on an mqtt broker.
 ## TODO
 
 * Useful for testing: subscribe on a command topic receiving function and parameters to execute.
-* Only on request is done. After processing the first result nothing happens (should send request in a loop)
 * Numbers are always zero (correct number of bytes, all zero), Strings work
 Finally: 
 * implement intelligent logic to operate and monitor the inverter automatically
