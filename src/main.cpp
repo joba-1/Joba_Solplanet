@@ -130,13 +130,12 @@ const char* gridCodeToString(uint16_t code) {
 }
 
 // helper: decode a single Modbus response and publish a human friendly payload to MQTT
-void decodeAndPublish(uint8_t serverAddress, uint16_t reg, uint8_t* data, size_t length) {
+void decodeAndPublish(uint8_t unitId, uint16_t addr, uint8_t* data, size_t length) {
     // find matching register definition by comparing register offsets
     const RegisterInfo* ri = nullptr;
     for (size_t i = 0; i < aiswei_registers_count; ++i) {
         const RegisterInfo &r = aiswei_registers[i];
-        uint16_t regOff = aiswei_dec2reg(r.addr);
-        if (reg >= regOff && reg < regOff + r.length) {
+        if (addr >= r.addr && addr < r.addr + r.length) {
             ri = &r;
             break;
         }
@@ -169,10 +168,10 @@ void decodeAndPublish(uint8_t serverAddress, uint16_t reg, uint8_t* data, size_t
         } else {
             slug[si] = '\0';
         }
-        snprintf(topic, sizeof(topic), "%s/modbus/%u/%s", mqttPrefix, serverAddress, slug);
+        snprintf(topic, sizeof(topic), "%s/%u/%s", mqttPrefix, unitId, slug);
     } else {
         // fallback to numeric register offset (legacy)
-        snprintf(topic, sizeof(topic), "%s/modbus/%u/%u", mqttPrefix, serverAddress, reg);
+        snprintf(topic, sizeof(topic), "%s/%u/%u", mqttPrefix, unitId, addr);
     }
 
     char payload[128] = {0};
@@ -188,7 +187,7 @@ void decodeAndPublish(uint8_t serverAddress, uint16_t reg, uint8_t* data, size_t
             if (mqttClient && mqttClient->is_connected()) {
                 mqttClient->publish(topic, payload, payload_len);
             }
-            LOG("decoded float: %s", payload);
+            LOG("0x%02x no info on %u: %s (float)", unitId, addr, payload);
             return;
         }
 
@@ -201,7 +200,7 @@ void decodeAndPublish(uint8_t serverAddress, uint16_t reg, uint8_t* data, size_t
         if (mqttClient && mqttClient->is_connected()) {
             mqttClient->publish(topic, payload, pos);
         }
-        LOG("no register meta -> hex: %s", payload);
+        LOG("0x%02x no info on %u: %s (hex)", unitId, addr, payload);
         return;
     }
 
@@ -241,7 +240,7 @@ void decodeAndPublish(uint8_t serverAddress, uint16_t reg, uint8_t* data, size_t
         if (mqttClient && mqttClient->is_connected()) {
             mqttClient->publish(topic, payload, pos);
         }
-        LOG("%s -> %s", ri->name, payload);
+        LOG("0x%02x %s -> %s (%s)", unitId, ri->name, payload, type);
         return;
     }
 
@@ -276,7 +275,7 @@ void decodeAndPublish(uint8_t serverAddress, uint16_t reg, uint8_t* data, size_t
         if (mqttClient && mqttClient->is_connected()) {
             mqttClient->publish(topic, payload, strlen(payload));
         }
-        LOG("%s -> %s", ri->name, payload);
+        LOG("0x%02x %s -> %s (%s)", unitId, ri->name, payload, type);
         return;
     }
 
@@ -295,7 +294,7 @@ void decodeAndPublish(uint8_t serverAddress, uint16_t reg, uint8_t* data, size_t
         if (mqttClient && mqttClient->is_connected()) {
             mqttClient->publish(topic, payload, strlen(payload));
         }
-        LOG("%s -> %s", ri->name, payload);
+        LOG("0x%02x %s -> %s (%s)", unitId, ri->name, payload, type);
         return;
     }
 
@@ -309,7 +308,7 @@ void decodeAndPublish(uint8_t serverAddress, uint16_t reg, uint8_t* data, size_t
         if (mqttClient && mqttClient->is_connected()) {
             mqttClient->publish(topic, payload, pos);
         }
-        LOG("%s -> %s (hex)", ri->name, payload);
+        LOG("0x%02x %s -> %s (hex)", unitId, ri->name, payload);
     }
 }
 
@@ -328,7 +327,7 @@ static void mqttThread() {
         
         LOG("Connecting to MQTT %s:%d", MQTT_SERVER, MQTT_PORT);
         mqttClient->connect(opts);
-        LOG("MQTT connected");
+        LOG("MQTT connected for topics %s/#", MQTT_TOPIC_PREFIX);
         
     } catch (const mqtt::exception& exc) {
         LOG("MQTT connection failed: %s", exc.what());
@@ -337,23 +336,38 @@ static void mqttThread() {
 
 // Modbus polling thread
 static void modbusThread() {
-    int pollCount = 0;
+    unsigned pollCount = 0;
+    // unsigned index = 0;
+    uint8_t id = 0;
+    bool requested = false;
     while (running) {
-        if (++pollCount % 10 == 0) {  // Every 1 seconds
-            LOG("Sending Modbus TCP request...");
+        if (++pollCount % 2 == 0) {  // Every 0.2 seconds
+            // uint16_t addr_dec = aiswei_registers[index].addr;
+            // LOG("Sending Modbus TCP request %u: %u", index, addr_dec);
+            // requested = requestAisweiRead(MODBUS_UNIT_ID, addr_dec);
+            // rotate through all known registers
+            // index = (index + 1) % aiswei_registers_count;
+
             // TODO check currentPowerValueOfSmartMeter_W(MODBUS_UNIT_ID);
             // serialNumber(MODBUS_UNIT_ID);
             // manufacturerName(MODBUS_UNIT_ID);
             // brandName(MODBUS_UNIT_ID);
-            // TODO check batterySOC(MODBUS_UNIT_ID);
+            requested = batterySOC(id++);
             // TODO check batteryVoltage_V(MODBUS_UNIT_ID);
             // TODO check Dword batteryEChargeToday_kWh(MODBUS_UNIT_ID);
             // numbers are always zero (matching byte results), strings work
         }
         
         // Try to parse response
-        parseModbusTCPResponse();
-        
+        if (requested && parseModbusTCPResponse()) {
+            // printf("\n");
+            requested = false;
+        } else {
+            if (requested) {
+                LOG("No response yet...");
+            }
+        }
+
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
