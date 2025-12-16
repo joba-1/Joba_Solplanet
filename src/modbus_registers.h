@@ -16,7 +16,7 @@ typedef struct {
     const char* access;   // "RO", "RW", or "WO"
 } RegisterInfo;
 
-extern const RegisterInfo aiswei_registers[];
+extern RegisterInfo aiswei_registers[];
 extern const size_t aiswei_registers_count;
 
 /**

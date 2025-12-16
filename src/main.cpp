@@ -337,22 +337,22 @@ static void mqttThread() {
 // Modbus polling thread
 static void modbusThread() {
     unsigned pollCount = 0;
-    // unsigned index = 0;
-    uint8_t id = 0;
+    unsigned index = 0;
+    /// uint8_t id = 0;
     bool requested = false;
     while (running) {
         if (++pollCount % 2 == 0) {  // Every 0.2 seconds
-            // uint16_t addr_dec = aiswei_registers[index].addr;
+            uint16_t addr_dec = aiswei_registers[index].addr;
             // LOG("Sending Modbus TCP request %u: %u", index, addr_dec);
-            // requested = requestAisweiRead(MODBUS_UNIT_ID, addr_dec);
+            requested = requestAisweiRead(MODBUS_UNIT_ID, addr_dec);
             // rotate through all known registers
-            // index = (index + 1) % aiswei_registers_count;
+            index = (index + 1) % aiswei_registers_count;
 
             // TODO check currentPowerValueOfSmartMeter_W(MODBUS_UNIT_ID);
             // serialNumber(MODBUS_UNIT_ID);
             // manufacturerName(MODBUS_UNIT_ID);
             // brandName(MODBUS_UNIT_ID);
-            requested = batterySOC(id++);
+            // requested = batterySOC(id++);
             // TODO check batteryVoltage_V(MODBUS_UNIT_ID);
             // TODO check Dword batteryEChargeToday_kWh(MODBUS_UNIT_ID);
             // numbers are always zero (matching byte results), strings work
@@ -378,6 +378,19 @@ int main(int argc, char** argv) {
     // Start MQTT thread
     std::thread mqtt_th(mqttThread);
     mqtt_th.detach();
+
+    // Initialize aiswei_registers array for testing (iterating through all entries): 
+    // each word as unsigned 16-bit at addresses 30000..49999
+    for (unsigned i=0; i < aiswei_registers_count; i++) {
+        aiswei_registers[i].addr = 30000 + i;
+        aiswei_registers[i].length = 1;
+        std::string *name = new std::string("Register " + std::to_string(30000 + i));
+        aiswei_registers[i].name = name->c_str();
+        aiswei_registers[i].type = "B16";
+        aiswei_registers[i].unit = NULL;
+        aiswei_registers[i].gain = 1.0f;
+        aiswei_registers[i].access = "RO";
+    }
 
     // Start Modbus polling thread
     std::thread modbus_th(modbusThread);

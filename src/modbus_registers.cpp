@@ -27,7 +27,7 @@ void decodeAndPublish(uint8_t unitId, uint16_t addr, uint8_t* data, size_t lengt
 // table extracted from chapter 3.3 of MB001_ASW GEN-Modbus-en_V2.1.1.
 // addr = decimal AISWEI address, length = number of 16-bit registers
 // name = first line of description, type, unit, gain, access
-const RegisterInfo aiswei_registers[] = {
+const RegisterInfo AISWEI_REGISTERS[] = {
     {31001, 1,  "Device Type",               "String",    NULL, 1.0f, "RO"},
     {31002, 1,  "Modbus address",            "U16",       NULL, 1.0f, "RO"},
     {31003, 16, "Serial Number",             "String",    NULL, 1.0f, "RO"},
@@ -285,8 +285,13 @@ const RegisterInfo aiswei_registers[] = {
     {45609, 1,  "LVRT active power limit mode", "E16",    NULL, 1.0f, "RW"},
 };
 
+// const RegisterInfo *aiswei_registers = AISWEI_REGISTERS;
+RegisterInfo aiswei_registers[20000];
+
 // define count of entries
+// const size_t aiswei_registers_count = sizeof(AISWEI_REGISTERS) / sizeof(AISWEI_REGISTERS[0]);
 const size_t aiswei_registers_count = sizeof(aiswei_registers) / sizeof(aiswei_registers[0]);
+
 
 int aiswei_find_register_index(uint16_t addr_dec) {
     for (size_t i = 0; i < aiswei_registers_count; ++i) {
