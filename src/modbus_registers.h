@@ -33,6 +33,11 @@ void cleanupModbusTCP();
 bool parseModbusTCPResponse();
 
 bool requestAisweiRead(uint8_t unitId, uint16_t addr_dec);
+// Read a contiguous range of AISWEI registers starting at decimal address
+// `start_addr_dec` for `quantity` 16-bit registers. This will set the
+// internal transaction address so the response parser can dispatch per-register
+// decoding. Returns true if request was issued.
+bool requestAisweiReadRange(uint8_t unitId, uint16_t start_addr_dec, uint16_t quantity);
 bool requestAisweiWriteWord(uint8_t unitId, uint16_t addr_dec, uint16_t value);
 bool requestAisweiWriteDWord(uint8_t unitId, uint16_t addr_dec, uint32_t value);
 

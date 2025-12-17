@@ -7,7 +7,15 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+
 #include "mqtt/client.h"
+
+// Networking for InfluxDB line-protocol sender
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <errno.h>
 
 #include "modbus_registers.h"
 
@@ -17,12 +25,166 @@
 // MQTT configuration
 #include "mqtt_config.h"
 
+// INFLUX configuration
+#include "influx_config.h"
+
 // Modbus TCP configuration
 #include "modbus_config.h"
 
 static const char* mqttPrefix = MQTT_TOPIC_PREFIX;
 static mqtt::client* mqttClient = nullptr;
 static std::atomic<bool> running(true);
+static std::string influxMeasurement;
+
+// escape tag value for Influx line protocol (commas, spaces, equals)
+static std::string escapeInfluxTag(const std::string &s) {
+    std::string out; out.reserve(s.size());
+    for (char c: s) {
+        if (c == ',' || c == ' ' || c == '=') { out.push_back('\\'); out.push_back(c); }
+        else out.push_back(c);
+    }
+    return out;
+}
+
+// escape field string for Influx line protocol (backslash and double quote)
+static std::string escapeInfluxFieldString(const std::string &s) {
+    std::string out; out.reserve(s.size());
+    for (char c: s) {
+        if (c == '\\' || c == '"') { out.push_back('\\'); out.push_back(c); }
+        else out.push_back(c);
+    }
+    return out;
+}
+
+// send a line to InfluxDB using HTTP POST to /write?db=<INFLUX_DB>
+static bool sendInfluxLine(const char* host, int port, const std::string &line) {
+    // Build HTTP request
+    std::string path = std::string("/write?db=") + INFLUX_DB;
+    std::string body = line;
+    char headers[256];
+    snprintf(headers, sizeof(headers), "POST %s HTTP/1.1\r\nHost: %s:%d\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n",
+             path.c_str(), host, port, body.size());
+
+    struct addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    char portbuf[16]; snprintf(portbuf, sizeof(portbuf), "%d", port);
+    struct addrinfo *res = nullptr;
+    if (getaddrinfo(host, portbuf, &hints, &res) != 0) return false;
+    int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (sock < 0) { freeaddrinfo(res); return false; }
+    bool ok = true;
+    if (connect(sock, res->ai_addr, res->ai_addrlen) != 0) ok = false;
+    if (ok) {
+        // send headers
+        size_t hlen = strlen(headers);
+        ssize_t sent = send(sock, headers, hlen, 0);
+        if (sent != (ssize_t)hlen) ok = false;
+        // send body
+        if (ok && !body.empty()) {
+            const char *buf = body.c_str();
+            size_t remaining = body.size();
+            while (remaining > 0) {
+                ssize_t s = send(sock, buf, remaining, 0);
+                if (s <= 0) { ok = false; break; }
+                remaining -= s;
+                buf += s;
+            }
+        }
+
+        // set a short receive timeout so we don't block forever
+        struct timeval tv;
+        tv.tv_sec = 2; tv.tv_usec = 0;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+
+        // read response (headers and optional body) into a buffer
+        std::string resp;
+        char rbuf[1024];
+        while (true) {
+            ssize_t r = recv(sock, rbuf, sizeof(rbuf), 0);
+            if (r > 0) resp.append(rbuf, r);
+            else break;
+        }
+
+        // parse status code from response start: "HTTP/1.1 204 ..."
+        if (!resp.empty()) {
+            // find end of status line
+            size_t nl = resp.find("\r\n");
+            std::string statusLine = (nl == std::string::npos) ? resp : resp.substr(0, nl);
+            // tokenise
+            size_t sp1 = statusLine.find(' ');
+            int status = 0;
+            if (sp1 != std::string::npos) {
+                size_t sp2 = statusLine.find(' ', sp1 + 1);
+                std::string code = (sp2 == std::string::npos) ? statusLine.substr(sp1 + 1) : statusLine.substr(sp1 + 1, sp2 - sp1 - 1);
+                status = atoi(code.c_str());
+            }
+            if (status == 204) {
+                // success
+                close(sock);
+                freeaddrinfo(res);
+                return true;
+            } else {
+                // log response for debugging
+                LOG("Influx HTTP error: %d response=%s", status, resp.c_str());
+                ok = false;
+            }
+        } else {
+            // no response
+            LOG("Influx: no HTTP response received");
+            ok = false;
+        }
+    }
+    close(sock);
+    freeaddrinfo(res);
+    return ok;
+}
+
+// Publish to MQTT (if available) and also write a line to InfluxDB using line-protocol.
+// Errors for MQTT and Influx are handled separately and do not affect each other.
+static void publishToMqttAndInflux(const char* topic, const char* payload, size_t payload_len, uint8_t unitId, uint16_t addr) {
+    // MQTT publish (isolated)
+    try {
+        if (mqttClient && mqttClient->is_connected()) mqttClient->publish(topic, payload, payload_len);
+    } catch (const mqtt::exception &e) {
+        LOG("MQTT publish failed: %s", e.what());
+    }
+
+    // Build Influx line: <measurement>,unit=<id>,topic=<lastTopic> value=<num> OR text="..."
+    std::string topicStr(topic);
+    size_t p = topicStr.find_last_of('/');
+    std::string lastTopic = (p == std::string::npos) ? topicStr : topicStr.substr(p+1);
+    std::string measurement = influxMeasurement.empty() ? std::string(MQTT_TOPIC_PREFIX) : influxMeasurement;
+
+    // Determine if payload is numeric
+    std::string payloadStr(payload, payload_len);
+    char *endptr = nullptr;
+    double num = strtod(payloadStr.c_str(), &endptr);
+    bool isNum = (endptr && *endptr == '\0');
+
+    std::string line;
+    line.reserve(128 + payload_len);
+    line += measurement;
+    line += ",unit=" + std::to_string(unitId);
+    line += ",addr=" + std::to_string(addr);
+    line += ",name=" + escapeInfluxTag(lastTopic);
+    line += ' ';
+    if (isNum) {
+        char numbuf[64]; snprintf(numbuf, sizeof(numbuf), "%.6g", num);
+        line += std::string("value=") + numbuf;
+    } else {
+        line += "text=\"" + escapeInfluxFieldString(payloadStr) + "\"";
+    }
+    line += '\n';
+
+    try {
+        if (!sendInfluxLine(INFLUX_SERVER, INFLUX_PORT, line)) {
+            LOG("Influx publish failed for %s", topic);
+        }
+    } catch (...) {
+        LOG("Influx publish exception for %s", topic);
+    }
+}
 
 
 // translate AISWEI warning codes to descriptive strings
@@ -184,9 +346,7 @@ void decodeAndPublish(uint8_t unitId, uint16_t addr, uint8_t* data, size_t lengt
             float value;
             memcpy(&value, tmp, sizeof(value));
             size_t payload_len = snprintf(payload, sizeof(payload), "%.3f", value);
-            if (mqttClient && mqttClient->is_connected()) {
-                mqttClient->publish(topic, payload, payload_len);
-            }
+            publishToMqttAndInflux(topic, payload, payload_len, unitId, addr);
             LOG("0x%02x no info on %u: %s (float)", unitId, addr, payload);
             return;
         }
@@ -197,9 +357,7 @@ void decodeAndPublish(uint8_t unitId, uint16_t addr, uint8_t* data, size_t lengt
             pos += snprintf(payload + pos, sizeof(payload) - pos, "%02x", data[i]);
         }
         payload[pos] = '\0';
-        if (mqttClient && mqttClient->is_connected()) {
-            mqttClient->publish(topic, payload, pos);
-        }
+        publishToMqttAndInflux(topic, payload, pos, unitId, addr);
         LOG("0x%02x no info on %u: %s (hex)", unitId, addr, payload);
         return;
     }
@@ -237,9 +395,7 @@ void decodeAndPublish(uint8_t unitId, uint16_t addr, uint8_t* data, size_t lengt
         }
         payload[pos] = '\0';
         if (payload[0] == '\0') strncpy(payload, "<empty>", sizeof(payload));
-        if (mqttClient && mqttClient->is_connected()) {
-            mqttClient->publish(topic, payload, pos);
-        }
+        publishToMqttAndInflux(topic, payload, pos, unitId, addr);
         LOG("0x%02x %s -> %s (%s)", unitId, ri->name, payload, type);
         return;
     }
@@ -272,9 +428,7 @@ void decodeAndPublish(uint8_t unitId, uint16_t addr, uint8_t* data, size_t lengt
                 snprintf(payload, sizeof(payload), "0x%04x", raw);
             }
         }
-        if (mqttClient && mqttClient->is_connected()) {
-            mqttClient->publish(topic, payload, strlen(payload));
-        }
+        publishToMqttAndInflux(topic, payload, strlen(payload), unitId, addr);
         LOG("0x%02x %s -> %s (%s)", unitId, ri->name, payload, type);
         return;
     }
@@ -291,9 +445,7 @@ void decodeAndPublish(uint8_t unitId, uint16_t addr, uint8_t* data, size_t lengt
                 fmt_with_gain(raw);
             }
         }
-        if (mqttClient && mqttClient->is_connected()) {
-            mqttClient->publish(topic, payload, strlen(payload));
-        }
+        publishToMqttAndInflux(topic, payload, strlen(payload), unitId, addr);
         LOG("0x%02x %s -> %s (%s)", unitId, ri->name, payload, type);
         return;
     }
@@ -305,9 +457,7 @@ void decodeAndPublish(uint8_t unitId, uint16_t addr, uint8_t* data, size_t lengt
             pos += snprintf(payload + pos, sizeof(payload) - pos, "%02x", data[i]);
         }
         payload[pos] = '\0';
-        if (mqttClient && mqttClient->is_connected()) {
-            mqttClient->publish(topic, payload, pos);
-        }
+        publishToMqttAndInflux(topic, payload, pos, unitId, addr);
         LOG("0x%02x %s -> %s (hex)", unitId, ri->name, payload);
     }
 }
@@ -342,11 +492,38 @@ static void modbusThread() {
     bool requested = false;
     while (running) {
         if (++pollCount % 2 == 0) {  // Every 0.2 seconds
-            uint16_t addr_dec = aiswei_registers[index].addr;
-            // LOG("Sending Modbus TCP request %u: %u", index, addr_dec);
-            requested = requestAisweiRead(MODBUS_UNIT_ID, addr_dec);
-            // rotate through all known registers
-            index = (index + 1) % aiswei_registers_count;
+            // Build a contiguous batch starting at `index` covering up to MODBUS_BATCH_SIZE 16-bit registers
+            unsigned startIdx = index;
+            uint16_t startAddrDec = aiswei_registers[startIdx].addr;
+            uint16_t startReg = aiswei_dec2reg(startAddrDec);
+            uint16_t totalRegs = aiswei_registers[startIdx].length;
+            unsigned k = 1;
+            uint16_t prevReg = startReg + totalRegs;
+            bool startIsHolding = (startAddrDec >= 40000 && startAddrDec < 50000);
+
+            while (totalRegs < MODBUS_BATCH_SIZE && k < aiswei_registers_count) {
+                unsigned idx = (startIdx + k) % aiswei_registers_count;
+                uint16_t addr_dec = aiswei_registers[idx].addr;
+                uint16_t reg = aiswei_dec2reg(addr_dec);
+                uint16_t len = aiswei_registers[idx].length;
+                bool isHolding = (addr_dec >= 40000 && addr_dec < 50000);
+                // stop if non-contiguous or different register type
+                if (reg != prevReg) break;
+                if (isHolding != startIsHolding) break;
+                if (totalRegs + len > MODBUS_BATCH_SIZE) break;
+                totalRegs += len;
+                prevReg = reg + len;
+                ++k;
+            }
+
+            // request the batch (totalRegs = number of 16-bit registers)
+            // startAddrDec is decimal AISWEI address (e.g. 31301)
+            // requestAisweiReadRange will set internal transaction address
+            // so the response parser can dispatch each register.
+            // LOG("Sending Modbus batch: idx=%u addr=%u regs=%u entries=%u", startIdx, startAddrDec, totalRegs, k);
+            requested = requestAisweiReadRange(MODBUS_UNIT_ID, startAddrDec, totalRegs);
+            // advance index by number of entries consumed
+            index = (startIdx + k) % aiswei_registers_count;
 
             // TODO check currentPowerValueOfSmartMeter_W(MODBUS_UNIT_ID);
             // serialNumber(MODBUS_UNIT_ID);
@@ -374,6 +551,13 @@ static void modbusThread() {
 
 int main(int argc, char** argv) {
     std::cout << "Starting Joba Solplanet Gateway..." << std::endl;
+
+    // derive Influx measurement from the last part of MQTT topic prefix
+    {
+        std::string prefix(MQTT_TOPIC_PREFIX);
+        size_t pos = prefix.find_last_of('/');
+        if (pos == std::string::npos) influxMeasurement = prefix; else influxMeasurement = prefix.substr(pos+1);
+    }
 
     // Start MQTT thread
     std::thread mqtt_th(mqttThread);

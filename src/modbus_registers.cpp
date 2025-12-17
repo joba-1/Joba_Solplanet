@@ -449,6 +449,20 @@ bool requestAisweiRead(uint8_t unitId, uint16_t addr_dec) {
     return sendModbusTCPRequest(unitId, 0x04, reg, length);
 }
 
+// Request a contiguous range of registers (quantity = number of 16-bit registers)
+bool requestAisweiReadRange(uint8_t unitId, uint16_t start_addr_dec, uint16_t quantity) {
+    // find index for start address to ensure it's a known region (not strictly required)
+    int idx = aiswei_find_register_index(start_addr_dec);
+    // set transaction start address for parser
+    transactionAddr = start_addr_dec;
+    uint16_t reg = aiswei_dec2reg(start_addr_dec);
+    // choose function code based on address range (3xxxx -> input regs (0x04), 4xxxx -> holding regs (0x03))
+    if (start_addr_dec >= 40000 && start_addr_dec < 50000) {
+        return sendModbusTCPRequest(unitId, 0x03, reg, quantity);
+    }
+    return sendModbusTCPRequest(unitId, 0x04, reg, quantity);
+}
+
 
 bool requestAisweiWriteWord(uint8_t unitId, uint16_t addr_dec, uint16_t value) {
     uint16_t reg = aiswei_dec2reg(addr_dec);
@@ -542,8 +556,30 @@ bool parseModbusTCPResponse() {
         // }
         // printf("\n");
 
-        // Decode and publish
-        decodeAndPublish(unitId, transactionAddr, registerData, dataBytes);
+        // Decode and publish each known register entry within the returned byte sequence.
+        // The response contains N registers (2 bytes each). We iterate through the
+        // aiswei register table starting from transactionAddr and dispatch each
+        // entry to decodeAndPublish with its appropriate byte slice.
+        size_t pos = 0;
+        while (pos + 1 < (size_t)dataBytes) {
+            uint16_t currentAddr = transactionAddr + (pos / 2);
+            int ridx = aiswei_find_register_index(currentAddr);
+            if (ridx < 0) {
+                // Unknown register: publish single 16-bit register as hex
+                uint8_t tmp[2]; tmp[0] = registerData[pos]; tmp[1] = registerData[pos+1];
+                decodeAndPublish(unitId, currentAddr, tmp, 2);
+                pos += 2;
+                continue;
+            }
+            uint16_t regs = aiswei_registers[ridx].length;
+            size_t bytesNeeded = regs * 2;
+            if (pos + bytesNeeded > (size_t)dataBytes) {
+                LOG("Response incomplete for addr %u: need %zu bytes, have %u", aiswei_registers[ridx].addr, bytesNeeded, dataBytes - (int)pos);
+                break;
+            }
+            decodeAndPublish(unitId, aiswei_registers[ridx].addr, &registerData[pos], bytesNeeded);
+            pos += bytesNeeded;
+        }
     }
     return true;
 }
