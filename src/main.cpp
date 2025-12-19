@@ -9,6 +9,9 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <ctime>
+#include <iomanip>
+#include <sstream>
 #include <nlohmann/json.hpp>
 
 #include "mqtt/client.h"
@@ -45,12 +48,25 @@ static std::string influxMeasurement;
 struct RegisterValue {
     std::string payload;
     std::string previousPayload;  // Track previous value
+    std::chrono::system_clock::time_point lastChangeTime;  // Timestamp of last change
     bool hasChanged = false;
     bool published = false;
 };
 
 static std::map<uint32_t, RegisterValue> registerValues;  // key: (unitId << 16) | addr
 static std::mutex registerValuesMutex;
+
+// Helper function to format system_clock::time_point as ISO 8601 string
+static std::string formatISO8601(const std::chrono::system_clock::time_point& tp) {
+    auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(tp);
+    auto tt = std::chrono::system_clock::to_time_t(sctp);
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(tp.time_since_epoch()) % 1000;
+    
+    std::ostringstream oss;
+    oss << std::put_time(std::gmtime(&tt), "%FT%T");
+    oss << '.' << std::setfill('0') << std::setw(3) << ms.count() << 'Z';
+    return oss.str();
+}
 
 // escape tag value for Influx line protocol (commas, spaces, equals)
 static std::string escapeInfluxTag(const std::string &s) {
@@ -160,6 +176,7 @@ static bool sendInfluxLine(const char* host, int port, const std::string &line) 
 static void publishToMqttAndInfluxOnChange(const char* topic, const char* payload, size_t payload_len, uint8_t unitId, uint16_t addr) {
     uint32_t key = ((uint32_t)unitId << 16) | addr;
     std::string payloadStr(payload, payload_len);
+    auto now = std::chrono::system_clock::now();
     
     {
         std::lock_guard<std::mutex> lock(registerValuesMutex);
@@ -169,13 +186,14 @@ static void publishToMqttAndInfluxOnChange(const char* topic, const char* payloa
         bool changed = false;
         if (it == registerValues.end()) {
             // First time seeing this register - just store it, don't mark as changed yet
-            registerValues[key] = {payloadStr, "", false, false};
+            registerValues[key] = {payloadStr, "", now, false, false};
         } else if (it->second.payload != payloadStr) {
             // Value changed after first reading
             changed = true;
             it->second.previousPayload = it->second.payload;
             it->second.payload = payloadStr;
             it->second.hasChanged = true;
+            it->second.lastChangeTime = now;
         }
         
         // Only publish if changed
@@ -237,7 +255,7 @@ static void publishSummary() {
         return;
     }
 
-    // Build JSON summary for MQTT with hierarchy: unit -> address -> name/value
+    // Build JSON summary for MQTT with hierarchy: unit -> address -> name/value/timestamp
     json summary = json::object();
     std::map<uint8_t, json> influxFields;  // unitId -> field map
 
@@ -270,9 +288,10 @@ static void publishSummary() {
             }
         }
 
-        // Add register data: name and value
+        // Add register data: name, value, and ISO 8601 timestamp
         summary[std::to_string(unitId)][addrStr]["name"] = registerName;
         summary[std::to_string(unitId)][addrStr]["value"] = value.payload;
+        summary[std::to_string(unitId)][addrStr]["changed"] = formatISO8601(value.lastChangeTime);
 
         // Determine if numeric for Influx
         char *endptr = nullptr;
