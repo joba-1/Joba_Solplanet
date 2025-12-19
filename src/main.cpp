@@ -7,6 +7,9 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <map>
+#include <mutex>
+#include <nlohmann/json.hpp>
 
 #include "mqtt/client.h"
 
@@ -31,10 +34,23 @@
 // Modbus TCP configuration
 #include "modbus_config.h"
 
+using json = nlohmann::json;
+
 static const char* mqttPrefix = MQTT_TOPIC_PREFIX;
 static mqtt::client* mqttClient = nullptr;
 static std::atomic<bool> running(true);
 static std::string influxMeasurement;
+
+// Track register values and changes
+struct RegisterValue {
+    std::string payload;
+    std::string previousPayload;  // Track previous value
+    bool hasChanged = false;
+    bool published = false;
+};
+
+static std::map<uint32_t, RegisterValue> registerValues;  // key: (unitId << 16) | addr
+static std::mutex registerValuesMutex;
 
 // escape tag value for Influx line protocol (commas, spaces, equals)
 static std::string escapeInfluxTag(const std::string &s) {
@@ -140,52 +156,207 @@ static bool sendInfluxLine(const char* host, int port, const std::string &line) 
     return ok;
 }
 
-// Publish to MQTT (if available) and also write a line to InfluxDB using line-protocol.
-// Errors for MQTT and Influx are handled separately and do not affect each other.
-static void publishToMqttAndInflux(const char* topic, const char* payload, size_t payload_len, uint8_t unitId, uint16_t addr) {
-    // MQTT publish (isolated)
-    try {
-        if (mqttClient && mqttClient->is_connected()) mqttClient->publish(topic, payload, payload_len);
-    } catch (const mqtt::exception &e) {
-        LOG("MQTT publish failed: %s", e.what());
-    }
-
-    // Build Influx line: <measurement>,unit=<id>,topic=<lastTopic> value=<num> OR text="..."
-    std::string topicStr(topic);
-    size_t p = topicStr.find_last_of('/');
-    std::string lastTopic = (p == std::string::npos) ? topicStr : topicStr.substr(p+1);
-    std::string measurement = influxMeasurement.empty() ? std::string(MQTT_TOPIC_PREFIX) : influxMeasurement;
-
-    // Determine if payload is numeric
+// Publish to MQTT and Influx only on change or first publish.
+static void publishToMqttAndInfluxOnChange(const char* topic, const char* payload, size_t payload_len, uint8_t unitId, uint16_t addr) {
+    uint32_t key = ((uint32_t)unitId << 16) | addr;
     std::string payloadStr(payload, payload_len);
-    char *endptr = nullptr;
-    double num = strtod(payloadStr.c_str(), &endptr);
-    bool isNum = (endptr && *endptr == '\0');
-
-    std::string line;
-    line.reserve(128 + payload_len);
-    line += measurement;
-    line += ",unit=" + std::to_string(unitId);
-    line += ",addr=" + std::to_string(addr);
-    line += ",name=" + escapeInfluxTag(lastTopic);
-    line += ' ';
-    if (isNum) {
-        char numbuf[64]; snprintf(numbuf, sizeof(numbuf), "%.6g", num);
-        line += std::string("value=") + numbuf;
-    } else {
-        line += "text=\"" + escapeInfluxFieldString(payloadStr) + "\"";
-    }
-    line += '\n';
-
-    try {
-        if (!sendInfluxLine(INFLUX_SERVER, INFLUX_PORT, line)) {
-            LOG("Influx publish failed for %s", topic);
+    
+    {
+        std::lock_guard<std::mutex> lock(registerValuesMutex);
+        auto it = registerValues.find(key);
+        
+        // Check if value has changed
+        bool changed = false;
+        if (it == registerValues.end()) {
+            // First time seeing this register - just store it, don't mark as changed yet
+            registerValues[key] = {payloadStr, "", false, false};
+        } else if (it->second.payload != payloadStr) {
+            // Value changed after first reading
+            changed = true;
+            it->second.previousPayload = it->second.payload;
+            it->second.payload = payloadStr;
+            it->second.hasChanged = true;
         }
-    } catch (...) {
-        LOG("Influx publish exception for %s", topic);
+        
+        // Only publish if changed
+        if (changed) {
+            // MQTT publish
+            try {
+                if (mqttClient && mqttClient->is_connected()) {
+                    mqttClient->publish(topic, payload, payload_len);
+                }
+            } catch (const mqtt::exception &e) {
+                LOG("MQTT publish failed: %s", e.what());
+            }
+
+            // Build Influx line
+            std::string topicStr(topic);
+            size_t p = topicStr.find_last_of('/');
+            std::string lastTopic = (p == std::string::npos) ? topicStr : topicStr.substr(p+1);
+            std::string measurement = influxMeasurement.empty() ? std::string(MQTT_TOPIC_PREFIX) : influxMeasurement;
+
+            // Determine if payload is numeric
+            char *endptr = nullptr;
+            double num = strtod(payloadStr.c_str(), &endptr);
+            bool isNum = (endptr && *endptr == '\0');
+
+            std::string line;
+            line.reserve(128 + payload_len);
+            line += measurement;
+            line += ",unit=" + std::to_string(unitId);
+            line += ",addr=" + std::to_string(addr);
+            line += ",name=" + escapeInfluxTag(lastTopic);
+            line += ' ';
+            if (isNum) {
+                char numbuf[64]; snprintf(numbuf, sizeof(numbuf), "%.6g", num);
+                line += std::string("value=") + numbuf;
+            } else {
+                line += "text=\"" + escapeInfluxFieldString(payloadStr) + "\"";
+            }
+            line += '\n';
+
+            try {
+                if (!sendInfluxLine(INFLUX_SERVER, INFLUX_PORT, line)) {
+                    LOG("Influx publish failed for %s", topic);
+                }
+            } catch (...) {
+                LOG("Influx publish exception for %s", topic);
+            }
+
+            LOG("Published change: %s -> %s", topic, payload);
+        }
     }
 }
 
+// Publish summary every minute to MQTT (JSON) and Influx
+static void publishSummary() {
+    std::lock_guard<std::mutex> lock(registerValuesMutex);
+    
+    if (registerValues.empty()) {
+        LOG("No values to summarize");
+        return;
+    }
+
+    // Build JSON summary for MQTT with hierarchy: unit -> address -> name/value
+    json summary = json::object();
+    std::map<uint8_t, json> influxFields;  // unitId -> field map
+
+    for (const auto& [key, value] : registerValues) {
+        // Only include registers that have changed at least once after first reading
+        if (!value.hasChanged) continue;
+
+        uint8_t unitId = (key >> 16) & 0xFF;
+        uint16_t addr = key & 0xFFFF;
+
+        // Ensure unit exists in summary
+        if (summary.find(std::to_string(unitId)) == summary.end()) {
+            summary[std::to_string(unitId)] = json::object();
+        }
+
+        // Ensure address exists under unit
+        std::string addrStr = std::to_string(addr);
+        if (summary[std::to_string(unitId)].find(addrStr) == summary[std::to_string(unitId)].end()) {
+            summary[std::to_string(unitId)][addrStr] = json::object();
+        }
+
+        // Find register name for this address
+        std::string registerName = addrStr;  // fallback to address
+        for (size_t i = 0; i < aiswei_registers_count; ++i) {
+            if (aiswei_registers[i].addr == addr) {
+                if (aiswei_registers[i].name && aiswei_registers[i].name[0]) {
+                    registerName = aiswei_registers[i].name;
+                }
+                break;
+            }
+        }
+
+        // Add register data: name and value
+        summary[std::to_string(unitId)][addrStr]["name"] = registerName;
+        summary[std::to_string(unitId)][addrStr]["value"] = value.payload;
+
+        // Determine if numeric for Influx
+        char *endptr = nullptr;
+        double num = strtod(value.payload.c_str(), &endptr);
+        bool isNum = (endptr && *endptr == '\0');
+
+        // Build field name: addr_<address> or addr_<address>_<payload_slug>
+        std::string fieldName = "addr_" + std::to_string(addr);
+        if (!isNum) {
+            // For non-numeric, append slug from payload
+            std::string slug = value.payload;
+            // Remove/replace non-alphanumeric
+            for (auto& c : slug) {
+                if (!isalnum(c)) c = '_';
+            }
+            fieldName += "_" + slug;
+        }
+
+        // Add to Influx field map
+        if (influxFields.find(unitId) == influxFields.end()) {
+            influxFields[unitId] = json::object();
+        }
+        
+        if (isNum) {
+            influxFields[unitId][fieldName] = num;
+        } else {
+            influxFields[unitId][fieldName] = value.payload;
+        }
+    }
+
+    // Only publish if there are changed values
+    if (summary.empty()) {
+        LOG("No changed values to summarize");
+        return;
+    }
+
+    // Publish MQTT summary
+    std::string summaryJson = summary.dump();
+    std::string summaryTopic = std::string(mqttPrefix) + "/summary";
+    try {
+        if (mqttClient && mqttClient->is_connected()) {
+            mqttClient->publish(summaryTopic, summaryJson.c_str(), summaryJson.size()+1);
+            LOG("Published MQTT summary to %s", summaryTopic.c_str());
+        }
+    } catch (const mqtt::exception &e) {
+        LOG("MQTT summary publish failed: %s", e.what());
+    }
+
+    // Publish Influx summary (one data point per unitId)
+    for (const auto& [unitId, fields] : influxFields) {
+        std::string line = "summary,unit=" + std::to_string(unitId);
+        
+        bool first = true;
+        for (const auto& [fieldName, fieldValue] : fields.items()) {
+            if (first) {
+                line += " ";
+            } 
+            else {
+                line += ",";
+            }
+            line += escapeInfluxTag(fieldName) + "=";
+            
+            if (fieldValue.is_number()) {
+                char numbuf[64];
+                snprintf(numbuf, sizeof(numbuf), "%.6g", (double)fieldValue);
+                line += numbuf;
+            } else {
+                line += "\"" + escapeInfluxFieldString(fieldValue.get<std::string>()) + "\"";
+            }
+            first = false;
+        }
+        line += '\n';
+
+        try {
+            if (!sendInfluxLine(INFLUX_SERVER, INFLUX_PORT, line)) {
+                LOG("Influx summary publish failed for unit %d", unitId);
+            } else {
+                LOG("Published Influx summary for unit %d with %zu fields", unitId, fields.size());
+            }
+        } catch (...) {
+            LOG("Influx summary publish exception for unit %d", unitId);
+        }
+    }
+}
 
 // translate AISWEI warning codes to descriptive strings
 const char* warnCodeToString(uint16_t code) {
@@ -346,8 +517,8 @@ void decodeAndPublish(uint8_t unitId, uint16_t addr, uint8_t* data, size_t lengt
             float value;
             memcpy(&value, tmp, sizeof(value));
             size_t payload_len = snprintf(payload, sizeof(payload), "%.3f", value);
-            publishToMqttAndInflux(topic, payload, payload_len, unitId, addr);
-            LOG("0x%02x no info on %u: %s (float)", unitId, addr, payload);
+            publishToMqttAndInfluxOnChange(topic, payload, payload_len, unitId, addr);
+            // LOG("0x%02x no info on %u: %s (float)", unitId, addr, payload);
             return;
         }
 
@@ -357,8 +528,8 @@ void decodeAndPublish(uint8_t unitId, uint16_t addr, uint8_t* data, size_t lengt
             pos += snprintf(payload + pos, sizeof(payload) - pos, "%02x", data[i]);
         }
         payload[pos] = '\0';
-        publishToMqttAndInflux(topic, payload, pos, unitId, addr);
-        LOG("0x%02x no info on %u: %s (hex)", unitId, addr, payload);
+        publishToMqttAndInfluxOnChange(topic, payload, pos, unitId, addr);
+        // LOG("0x%02x no info on %u: %s (hex)", unitId, addr, payload);
         return;
     }
 
@@ -395,8 +566,8 @@ void decodeAndPublish(uint8_t unitId, uint16_t addr, uint8_t* data, size_t lengt
         }
         payload[pos] = '\0';
         if (payload[0] == '\0') strncpy(payload, "<empty>", sizeof(payload));
-        publishToMqttAndInflux(topic, payload, pos, unitId, addr);
-        LOG("0x%02x %s -> %s (%s)", unitId, ri->name, payload, type);
+        publishToMqttAndInfluxOnChange(topic, payload, pos, unitId, addr);
+        // LOG("0x%02x %s -> %s (%s)", unitId, ri->name, payload, type);
         return;
     }
 
@@ -428,8 +599,8 @@ void decodeAndPublish(uint8_t unitId, uint16_t addr, uint8_t* data, size_t lengt
                 snprintf(payload, sizeof(payload), "0x%04x", raw);
             }
         }
-        publishToMqttAndInflux(topic, payload, strlen(payload), unitId, addr);
-        LOG("0x%02x %s -> %s (%s)", unitId, ri->name, payload, type);
+        publishToMqttAndInfluxOnChange(topic, payload, strlen(payload), unitId, addr);
+        // LOG("0x%02x %s -> %s (%s)", unitId, ri->name, payload, type);
         return;
     }
 
@@ -445,8 +616,8 @@ void decodeAndPublish(uint8_t unitId, uint16_t addr, uint8_t* data, size_t lengt
                 fmt_with_gain(raw);
             }
         }
-        publishToMqttAndInflux(topic, payload, strlen(payload), unitId, addr);
-        LOG("0x%02x %s -> %s (%s)", unitId, ri->name, payload, type);
+        publishToMqttAndInfluxOnChange(topic, payload, strlen(payload), unitId, addr);
+        // LOG("0x%02x %s -> %s (%s)", unitId, ri->name, payload, type);
         return;
     }
 
@@ -457,8 +628,8 @@ void decodeAndPublish(uint8_t unitId, uint16_t addr, uint8_t* data, size_t lengt
             pos += snprintf(payload + pos, sizeof(payload) - pos, "%02x", data[i]);
         }
         payload[pos] = '\0';
-        publishToMqttAndInflux(topic, payload, pos, unitId, addr);
-        LOG("0x%02x %s -> %s (hex)", unitId, ri->name, payload);
+        publishToMqttAndInfluxOnChange(topic, payload, pos, unitId, addr);
+        // LOG("0x%02x %s -> %s (hex)", unitId, ri->name, payload);
     }
 }
 
@@ -488,10 +659,12 @@ static void mqttThread() {
 static void modbusThread() {
     unsigned pollCount = 0;
     unsigned index = 0;
+    unsigned prev_index = index;
     /// uint8_t id = 0;
     bool requested = false;
+    
     while (running) {
-        if (++pollCount % 2 == 0) {  // Every 0.2 seconds
+        if (++pollCount % 4 == 0) {  // Every 0.2 seconds
             // Build a contiguous batch starting at `index` covering up to MODBUS_BATCH_SIZE 16-bit registers
             unsigned startIdx = index;
             uint16_t startAddrDec = aiswei_registers[startIdx].addr;
@@ -523,6 +696,7 @@ static void modbusThread() {
             // LOG("Sending Modbus batch: idx=%u addr=%u regs=%u entries=%u", startIdx, startAddrDec, totalRegs, k);
             requested = requestAisweiReadRange(MODBUS_UNIT_ID, startAddrDec, totalRegs);
             // advance index by number of entries consumed
+            prev_index = index;
             index = (startIdx + k) % aiswei_registers_count;
 
             // TODO check currentPowerValueOfSmartMeter_W(MODBUS_UNIT_ID);
@@ -537,15 +711,17 @@ static void modbusThread() {
         
         // Try to parse response
         if (requested && parseModbusTCPResponse()) {
-            // printf("\n");
             requested = false;
-        } else {
-            if (requested) {
-                LOG("No response yet...");
-            }
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Check if we finished a sweep for summary publication
+        if (index < prev_index && !requested) {
+            // completed a full sweep
+            prev_index = index;
+            publishSummary();
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
 
