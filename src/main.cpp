@@ -14,6 +14,7 @@
 #include <sstream>
 #include <fstream>
 #include <set>
+#include <algorithm>
 #include <nlohmann/json.hpp>
 
 #include "mqtt/client.h"
@@ -58,6 +59,7 @@ struct RegisterValue {
 
 static std::map<uint32_t, RegisterValue> registerValues;  // key: (unitId << 16) | addr
 static std::set<uint32_t> changedAddresses;  // persistent list of changed addresses
+static std::vector<unsigned> changedAddressesRanges;  // indices of ranges containing changed addresses
 static std::mutex registerValuesMutex;
 
 // Helper function to format system_clock::time_point as ISO 8601 string
@@ -732,6 +734,19 @@ static void mqttThread() {
     }
 }
 
+// Helper function to check if a range contains any changed addresses
+static bool rangeContainsChangedAddress(unsigned startIdx, unsigned k) {
+    for (unsigned i = 0; i < k; ++i) {
+        unsigned idx = (startIdx + i) % aiswei_registers_count;
+        uint16_t addr = aiswei_registers[idx].addr;
+        uint32_t key = ((uint32_t)MODBUS_UNIT_ID << 16) | addr;
+        if (changedAddresses.find(key) != changedAddresses.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Modbus polling thread
 static void modbusThread() {
     unsigned pollCount = 0;
@@ -739,51 +754,98 @@ static void modbusThread() {
     unsigned prev_index = index;
     /// uint8_t id = 0;
     bool requested = false;
+    bool prioRange = true;
+    int changedRangeIndex = 0;  // Index into changedAddressesRanges
     
     while (running) {
-        if (++pollCount % 4 == 0) {  // Every 0.2 seconds
-            // Build a contiguous batch starting at `index` covering up to MODBUS_BATCH_SIZE 16-bit registers
-            unsigned startIdx = index;
-            uint16_t startAddrDec = aiswei_registers[startIdx].addr;
-            uint16_t startReg = aiswei_dec2reg(startAddrDec);
-            uint16_t totalRegs = aiswei_registers[startIdx].length;
-            unsigned k = 1;
-            uint16_t prevReg = startReg + totalRegs;
-            bool startIsHolding = (startAddrDec >= 40000 && startAddrDec < 50000);
+        if (++pollCount % 4 == 0) {  // Every 0.4 seconds
+            prioRange = !prioRange;
+            bool shouldProcessChanged = false;
+            unsigned startIdx = 0;
+            uint16_t startAddrDec = 0;
+            uint16_t totalRegs = 0;
+            unsigned k = 0;
 
-            while (totalRegs < MODBUS_BATCH_SIZE && k < aiswei_registers_count) {
-                unsigned idx = (startIdx + k) % aiswei_registers_count;
-                uint16_t addr_dec = aiswei_registers[idx].addr;
-                uint16_t reg = aiswei_dec2reg(addr_dec);
-                uint16_t len = aiswei_registers[idx].length;
-                bool isHolding = (addr_dec >= 40000 && addr_dec < 50000);
-                // stop if non-contiguous or different register type
-                if (reg != prevReg) break;
-                if (isHolding != startIsHolding) break;
-                if (totalRegs + len > MODBUS_BATCH_SIZE) break;
-                totalRegs += len;
-                prevReg = reg + len;
-                ++k;
+            // Check if we should process a changed address range after each normal iteration
+            if (!requested ) {
+                if (prioRange && !changedAddressesRanges.empty()) {
+                    // After each full sweep, process one changed address range
+                    shouldProcessChanged = true;
+                    
+                    // Get the next changed address range to process
+                    if (changedRangeIndex >= (int)changedAddressesRanges.size()) {
+                        changedRangeIndex = 0;
+                    }
+                    
+                    startIdx = changedAddressesRanges[changedRangeIndex];
+                    changedRangeIndex++;
+                    
+                    // Build the range
+                    startAddrDec = aiswei_registers[startIdx].addr;
+                    uint16_t startReg = aiswei_dec2reg(startAddrDec);
+                    totalRegs = aiswei_registers[startIdx].length;
+                    k = 1;
+                    uint16_t prevReg = startReg + totalRegs;
+                    bool startIsHolding = (startAddrDec >= 40000 && startAddrDec < 50000);
+
+                    while (totalRegs < MODBUS_BATCH_SIZE && k < aiswei_registers_count) {
+                        unsigned idx = (startIdx + k) % aiswei_registers_count;
+                        uint16_t addr_dec = aiswei_registers[idx].addr;
+                        uint16_t reg = aiswei_dec2reg(addr_dec);
+                        uint16_t len = aiswei_registers[idx].length;
+                        bool isHolding = (addr_dec >= 40000 && addr_dec < 50000);
+                        // stop if non-contiguous or different register type
+                        if (reg != prevReg) break;
+                        if (isHolding != startIsHolding) break;
+                        if (totalRegs + len > MODBUS_BATCH_SIZE) break;
+                        totalRegs += len;
+                        prevReg = reg + len;
+                        ++k;
+                    }
+                    // LOG("Processing changed address range: idx=%u addr=%u regs=%u entries=%u", startIdx, startAddrDec, totalRegs, k);
+                } 
+                else {
+                    // Normal processing: build a contiguous batch starting at `index`
+                    startIdx = index;
+                    startAddrDec = aiswei_registers[startIdx].addr;
+                    uint16_t startReg = aiswei_dec2reg(startAddrDec);
+                    totalRegs = aiswei_registers[startIdx].length;
+                    k = 1;
+                    uint16_t prevReg = startReg + totalRegs;
+                    bool startIsHolding = (startAddrDec >= 40000 && startAddrDec < 50000);
+
+                    while (totalRegs < MODBUS_BATCH_SIZE && k < aiswei_registers_count) {
+                        unsigned idx = (startIdx + k) % aiswei_registers_count;
+                        uint16_t addr_dec = aiswei_registers[idx].addr;
+                        uint16_t reg = aiswei_dec2reg(addr_dec);
+                        uint16_t len = aiswei_registers[idx].length;
+                        bool isHolding = (addr_dec >= 40000 && addr_dec < 50000);
+                        // stop if non-contiguous or different register type
+                        if (reg != prevReg) break;
+                        if (isHolding != startIsHolding) break;
+                        if (totalRegs + len > MODBUS_BATCH_SIZE) break;
+                        totalRegs += len;
+                        prevReg = reg + len;
+                        ++k;
+                    }
+
+                    // Check if this range contains changed addresses
+                    if (rangeContainsChangedAddress(startIdx, k)) {
+                        // Add to changed ranges list if not already there
+                        if (std::find(changedAddressesRanges.begin(), changedAddressesRanges.end(), startIdx) 
+                            == changedAddressesRanges.end()) {
+                            changedAddressesRanges.push_back(startIdx);
+                            LOG("Added range to changed list: idx=%u (total changed ranges=%zu)", startIdx, changedAddressesRanges.size());
+                        }
+                    }
+
+                    prev_index = index;
+                    index = (startIdx + k) % aiswei_registers_count;
+                }
+
+                // request the batch (totalRegs = number of 16-bit registers)
+                requested = requestAisweiReadRange(MODBUS_UNIT_ID, startAddrDec, totalRegs);
             }
-
-            // request the batch (totalRegs = number of 16-bit registers)
-            // startAddrDec is decimal AISWEI address (e.g. 31301)
-            // requestAisweiReadRange will set internal transaction address
-            // so the response parser can dispatch each register.
-            // LOG("Sending Modbus batch: idx=%u addr=%u regs=%u entries=%u", startIdx, startAddrDec, totalRegs, k);
-            requested = requestAisweiReadRange(MODBUS_UNIT_ID, startAddrDec, totalRegs);
-            // advance index by number of entries consumed
-            prev_index = index;
-            index = (startIdx + k) % aiswei_registers_count;
-
-            // TODO check currentPowerValueOfSmartMeter_W(MODBUS_UNIT_ID);
-            // serialNumber(MODBUS_UNIT_ID);
-            // manufacturerName(MODBUS_UNIT_ID);
-            // brandName(MODBUS_UNIT_ID);
-            // requested = batterySOC(id++);
-            // TODO check batteryVoltage_V(MODBUS_UNIT_ID);
-            // TODO check Dword batteryEChargeToday_kWh(MODBUS_UNIT_ID);
-            // numbers are always zero (matching byte results), strings work
         }
         
         // Try to parse response
@@ -798,7 +860,7 @@ static void modbusThread() {
             publishSummary();
         }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 
