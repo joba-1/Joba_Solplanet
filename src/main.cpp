@@ -12,6 +12,8 @@
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+#include <fstream>
+#include <set>
 #include <nlohmann/json.hpp>
 
 #include "mqtt/client.h"
@@ -43,6 +45,7 @@ static const char* mqttPrefix = MQTT_TOPIC_PREFIX;
 static mqtt::client* mqttClient = nullptr;
 static std::atomic<bool> running(true);
 static std::string influxMeasurement;
+static const char* CHANGED_ADDRESSES_FILE = ".joba_changed_addresses.json";
 
 // Track register values and changes
 struct RegisterValue {
@@ -54,6 +57,7 @@ struct RegisterValue {
 };
 
 static std::map<uint32_t, RegisterValue> registerValues;  // key: (unitId << 16) | addr
+static std::set<uint32_t> changedAddresses;  // persistent list of changed addresses
 static std::mutex registerValuesMutex;
 
 // Helper function to format system_clock::time_point as ISO 8601 string
@@ -66,6 +70,47 @@ static std::string formatISO8601(const std::chrono::system_clock::time_point& tp
     oss << std::put_time(std::gmtime(&tt), "%FT%T");
     oss << '.' << std::setfill('0') << std::setw(3) << ms.count() << 'Z';
     return oss.str();
+}
+
+// Load persistent changed addresses from file
+static void loadChangedAddresses() {
+    std::ifstream file(CHANGED_ADDRESSES_FILE);
+    if (!file.is_open()) {
+        LOG("No persistent changed addresses file found");
+        return;
+    }
+
+    try {
+        json data = json::parse(file);
+        if (data.is_array()) {
+            for (const auto& addr : data) {
+                if (addr.is_number_unsigned()) {
+                    changedAddresses.insert(addr.get<uint32_t>());
+                }
+            }
+            LOG("Loaded %zu persistent changed addresses", changedAddresses.size());
+        }
+    } catch (const std::exception& e) {
+        LOG("Error loading changed addresses: %s", e.what());
+    }
+    file.close();
+}
+
+// Save persistent changed addresses to file
+static void saveChangedAddresses() {
+    try {
+        json data = json::array();
+        for (uint32_t addr : changedAddresses) {
+            data.push_back(addr);
+        }
+        
+        std::ofstream file(CHANGED_ADDRESSES_FILE);
+        file << data.dump(2);
+        file.close();
+        LOG("Saved %zu changed addresses to %s", changedAddresses.size(), CHANGED_ADDRESSES_FILE);
+    } catch (const std::exception& e) {
+        LOG("Error saving changed addresses: %s", e.what());
+    }
 }
 
 // escape tag value for Influx line protocol (commas, spaces, equals)
@@ -187,6 +232,12 @@ static void publishToMqttAndInfluxOnChange(const char* topic, const char* payloa
         if (it == registerValues.end()) {
             // First time seeing this register - just store it, don't mark as changed yet
             registerValues[key] = {payloadStr, "", now, false, false};
+            // Check if this address was previously marked as changed
+            if (changedAddresses.find(key) != changedAddresses.end()) {
+                // This address changed in a previous run, mark as changed
+                registerValues[key].hasChanged = true;
+                registerValues[key].lastChangeTime = now;
+            }
         } else if (it->second.payload != payloadStr) {
             // Value changed after first reading
             changed = true;
@@ -194,6 +245,13 @@ static void publishToMqttAndInfluxOnChange(const char* topic, const char* payloa
             it->second.payload = payloadStr;
             it->second.hasChanged = true;
             it->second.lastChangeTime = now;
+            // Add to persistent list
+            size_t size = changedAddresses.size();
+            changedAddresses.insert(key);
+            if (changedAddresses.size() != size) {
+                // New entry added, save to file
+                saveChangedAddresses();
+            }
         }
         
         // Only publish if changed
@@ -260,7 +318,7 @@ static void publishSummary() {
     std::map<uint8_t, json> influxFields;  // unitId -> field map
 
     for (const auto& [key, value] : registerValues) {
-        // Only include registers that have changed at least once after first reading
+        // Only include registers that have changed (from current session or persistent list)
         if (!value.hasChanged) continue;
 
         uint8_t unitId = (key >> 16) & 0xFF;
@@ -333,8 +391,8 @@ static void publishSummary() {
     std::string summaryTopic = std::string(mqttPrefix) + "/summary";
     try {
         if (mqttClient && mqttClient->is_connected()) {
-            mqttClient->publish(summaryTopic, summaryJson.c_str(), summaryJson.size()+1);
-            LOG("Published MQTT summary to %s", summaryTopic.c_str());
+            mqttClient->publish(summaryTopic, summaryJson.c_str(), summaryJson.size());
+            LOG("Published MQTT summary to %s with %zu units", summaryTopic.c_str(), summary.size());
         }
     } catch (const mqtt::exception &e) {
         LOG("MQTT summary publish failed: %s", e.what());
@@ -746,6 +804,9 @@ static void modbusThread() {
 
 int main(int argc, char** argv) {
     std::cout << "Starting Joba Solplanet Gateway..." << std::endl;
+
+    // Load persistent changed addresses
+    loadChangedAddresses();
 
     // derive Influx measurement from the last part of MQTT topic prefix
     {
