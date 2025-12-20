@@ -1,0 +1,3 @@
+#define INFLUX_SERVER "job4"
+#define INFLUX_PORT 8086
+#define INFLUX_DB "joba_solplanet"

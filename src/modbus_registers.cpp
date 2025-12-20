@@ -1,13 +1,33 @@
 #include "modbus_registers.h"
-#include <esp32ModbusRTU.h>
 
-// the global modbus object is defined in main.cpp
-extern esp32ModbusRTU modbus;
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+
+#include <unistd.h>
+#include <stdio.h>
+
+// Logging helper
+#define LOG(fmt, ...) printf("[%s] " fmt "\n", __FUNCTION__, ##__VA_ARGS__)
+
+// Modbus TCP configuration
+#include "modbus_config.h"
+
+
+// ModbusTCP socket handle
+int modbusSocket = -1;
+
+static uint16_t transactionId = 0;   // id of current transaction to match register responses
+static uint16_t transactionAddr = 0;  // first register address of current transaction
+
+// decode a single Modbus response and publish a human friendly payload to MQTT (defined in main.cpp)
+void decodeAndPublish(uint8_t unitId, uint16_t addr, uint8_t* data, size_t length);
 
 // table extracted from chapter 3.3 of MB001_ASW GEN-Modbus-en_V2.1.1.
 // addr = decimal AISWEI address, length = number of 16-bit registers
 // name = first line of description, type, unit, gain, access
-const RegisterInfo aiswei_registers[] = {
+const RegisterInfo AISWEI_REGISTERS[] = {
     {31001, 1,  "Device Type",               "String",    NULL, 1.0f, "RO"},
     {31002, 1,  "Modbus address",            "U16",       NULL, 1.0f, "RO"},
     {31003, 16, "Serial Number",             "String",    NULL, 1.0f, "RO"},
@@ -265,13 +285,18 @@ const RegisterInfo aiswei_registers[] = {
     {45609, 1,  "LVRT active power limit mode", "E16",    NULL, 1.0f, "RW"},
 };
 
+// const RegisterInfo *aiswei_registers = AISWEI_REGISTERS;
+RegisterInfo aiswei_registers[20000];
+
 // define count of entries
+// const size_t aiswei_registers_count = sizeof(AISWEI_REGISTERS) / sizeof(AISWEI_REGISTERS[0]);
 const size_t aiswei_registers_count = sizeof(aiswei_registers) / sizeof(aiswei_registers[0]);
 
-int aiswei_find_register_index(uint32_t addr_dec) {
+
+int aiswei_find_register_index(uint16_t addr_dec) {
     for (size_t i = 0; i < aiswei_registers_count; ++i) {
-        uint32_t start = aiswei_registers[i].addr;
-        uint32_t end = start + (aiswei_registers[i].length > 0 ? (aiswei_registers[i].length - 1) : 0);
+        uint16_t start = aiswei_registers[i].addr;
+        uint16_t end = start + (aiswei_registers[i].length > 0 ? (aiswei_registers[i].length - 1) : 0);
         if (addr_dec >= start && addr_dec <= end) return (int)i;
     }
     return -1;
@@ -279,445 +304,685 @@ int aiswei_find_register_index(uint32_t addr_dec) {
 
 // Convert AISWEI decimal address (e.g. 31001) to Modbus register index:
 // strip leading '3' or '4' (equivalent to addr % 10000), then subtract 1.
-uint16_t aiswei_dec2reg(uint32_t addr_dec) {
-    uint32_t v = addr_dec % 10000;
-    if (v == 0) v = 0;
-    return static_cast<uint16_t>((v == 0) ? 0 : (v - 1));
+uint16_t aiswei_dec2reg(uint16_t addr_dec) {
+    uint16_t v = addr_dec % 10000;
+    return (v == 0) ? 9999 : (v - 1);
 }
 
-static void requestAisweiRead(uint8_t slave, uint32_t addr_dec) {
+// Modbus TCP connection management
+static bool connectModbusTCP() {
+    if (modbusSocket != -1) {
+        return true;  // already connected
+    }
+
+    const char *server = MODBUS_SERVER;
+    int port = MODBUS_PORT;
+
+    struct hostent* host = gethostbyname(server);
+    if (!host) {
+        LOG("Failed to resolve hostname: %s", server);
+        return false;
+    }
+
+    modbusSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (modbusSocket < 0) {
+        LOG("Failed to create socket");
+        return false;
+    }
+
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    server_addr.sin_addr.s_addr = ((struct in_addr*)host->h_addr)->s_addr;
+
+    if (connect(modbusSocket, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        LOG("Failed to connect to Modbus TCP server %s:%d", server, port);
+        close(modbusSocket);
+        modbusSocket = -1;
+        return false;
+    }
+
+    LOG("Connected to Modbus TCP server %s:%d", server, port);
+    return true;
+}
+
+void cleanupModbusTCP() {
+    if (modbusSocket != -1) {
+        close(modbusSocket);
+        modbusSocket = -1;
+        LOG("Modbus TCP connection closed");
+    }
+}
+
+// Modbus TCP read request builder and sender (no address translation)
+static bool sendModbusTCPRequest(uint8_t unitId, uint8_t functionCode, uint16_t startAddress, uint16_t quantity) {
+    if (!connectModbusTCP()) {
+        return false;
+    }
+
+    // Build Modbus TCP frame
+    uint8_t frame[12];
+    uint16_t tid = ++transactionId;
+    
+    // MBAP Header (7 bytes)
+    frame[0] = (tid >> 8) & 0xFF;           // Transaction ID (high)
+    frame[1] = tid & 0xFF;                  // Transaction ID (low)
+    frame[2] = 0x00;                        // Protocol ID (high) = 0
+    frame[3] = 0x00;                        // Protocol ID (low) = 0
+    frame[4] = 0x00;                        // Length (high) = 6 bytes
+    frame[5] = 0x06;                        // Length (low)
+    frame[6] = unitId;                      // Unit ID
+    
+    // PDU (5 bytes)
+    frame[7] = functionCode;                // Function code (0x03 = Read Holding Registers)
+    frame[8] = (startAddress >> 8) & 0xFF;  // Starting Address (high)
+    frame[9] = startAddress & 0xFF;         // Starting Address (low)
+    frame[10] = (quantity >> 8) & 0xFF;     // Quantity (high)
+    frame[11] = quantity & 0xFF;            // Quantity (low)
+
+    if (send(modbusSocket, frame, sizeof(frame), 0) < 0) {
+        LOG("Failed to send Modbus TCP request");
+        close(modbusSocket);
+        modbusSocket = -1;
+        return false;
+    }
+
+    // LOG("Sent Modbus TCP request: unitId=%u, fc=0x%02x, addr=%u, qty=%u", unitId, functionCode, startAddress, quantity);
+    return true;
+}
+
+// Modbus TCP write word request builder and sender (no address translation)
+static bool sendModbusTCPWriteRequest(uint8_t unitId, uint16_t registerAddress, uint16_t value) {
+    if (!connectModbusTCP()) {
+        return false;
+    }
+
+    uint8_t frame[12];
+    uint16_t tid = ++transactionId;
+
+    // MBAP Header
+    frame[0] = (tid >> 8) & 0xFF;
+    frame[1] = tid & 0xFF;
+    frame[2] = 0x00;
+    frame[3] = 0x00;
+    frame[4] = 0x00;
+    frame[5] = 0x06;
+    frame[6] = unitId;
+    
+    // PDU (Function Code 0x06 - Write Single Register)
+    frame[7] = 0x06;
+    frame[8] = (registerAddress >> 8) & 0xFF;
+    frame[9] = registerAddress & 0xFF;
+    frame[10] = (value >> 8) & 0xFF;
+    frame[11] = value & 0xFF;
+
+    if (send(modbusSocket, frame, sizeof(frame), 0) < 0) {
+        LOG("Failed to send write request\n");
+        return false;
+    }
+
+    LOG("Sent Modbus TCP write: reg=%u, value=%u\n", registerAddress, value);
+    return true;
+}
+
+
+bool requestAisweiRead(uint8_t unitId, uint16_t addr_dec) {
     // determine register index and length from table if present
     int idx = aiswei_find_register_index(addr_dec);
     uint16_t length = 1;
     if (idx >= 0) length = aiswei_registers[idx].length;
     uint16_t reg = aiswei_dec2reg(addr_dec);
 
-    if (addr_dec >= 40000 && addr_dec < 50000) {
-        // addresses starting with 4xxxx are holding registers
-        modbus.readHoldingRegisters(slave, reg, length);
-    } else {
-        // default to input registers for 3xxxx / others
-        modbus.readInputRegisters(slave, reg, length);
+    if (idx < 0) {
+        LOG("Unknown modbus address: %u", addr_dec);
+        return false;
     }
+
+    transactionAddr = addr_dec;
+
+    if (addr_dec >= 40000 && addr_dec < 50000) {
+        // addresses starting with 4xxxx are holding registers (function code 0x03)
+        return sendModbusTCPRequest(unitId, 0x03, reg, length);
+    } 
+    
+    // default to input registers for 3xxxx (function code 0x04)
+    return sendModbusTCPRequest(unitId, 0x04, reg, length);
 }
+
+// Request a contiguous range of registers (quantity = number of 16-bit registers)
+bool requestAisweiReadRange(uint8_t unitId, uint16_t start_addr_dec, uint16_t quantity) {
+    // find index for start address to ensure it's a known region (not strictly required)
+    int idx = aiswei_find_register_index(start_addr_dec);
+    // set transaction start address for parser
+    transactionAddr = start_addr_dec;
+    uint16_t reg = aiswei_dec2reg(start_addr_dec);
+    // choose function code based on address range (3xxxx -> input regs (0x04), 4xxxx -> holding regs (0x03))
+    if (start_addr_dec >= 40000 && start_addr_dec < 50000) {
+        return sendModbusTCPRequest(unitId, 0x03, reg, quantity);
+    }
+    return sendModbusTCPRequest(unitId, 0x04, reg, quantity);
+}
+
+
+bool requestAisweiWriteWord(uint8_t unitId, uint16_t addr_dec, uint16_t value) {
+    uint16_t reg = aiswei_dec2reg(addr_dec);
+    transactionAddr = addr_dec;
+    return sendModbusTCPWriteRequest(unitId, reg, value);
+}
+
+bool requestAisweiWriteDWord(uint8_t unitId, uint16_t addr_dec, uint32_t value) {
+    // For U32, we need to write two consecutive registers
+    uint16_t reg = aiswei_dec2reg(addr_dec);
+    uint16_t highWord = (value >> 16) & 0xFFFF;
+    uint16_t lowWord = value & 0xFFFF;
+    
+    // Write high word first
+    transactionAddr = addr_dec;
+    if (!sendModbusTCPWriteRequest(unitId, reg, highWord)) return false;
+    usleep(50000); // 50ms delay between writes
+    // Write low word second
+    return sendModbusTCPWriteRequest(unitId, reg + 1, lowWord);
+}
+
+
+// Modbus TCP response parser
+bool parseModbusTCPResponse() {
+    if (modbusSocket < 0) return false;
+
+    uint8_t buffer[256];
+    int bytesRead = recv(modbusSocket, buffer, sizeof(buffer), 0);
+
+    if (bytesRead < 0) {
+        LOG("Failed to read from socket");
+        close(modbusSocket);
+        modbusSocket = -1;
+        return false;
+    }
+
+    if (bytesRead == 0) {
+        LOG("Connection closed by server");
+        close(modbusSocket);
+        modbusSocket = -1;
+        return true;
+    }
+
+    if (bytesRead < 9) {
+        LOG("Response too short: %d bytes", bytesRead);
+        return true;
+    }
+
+    // Parse MBAP Header
+    uint16_t tid = ((uint16_t)buffer[0] << 8) | buffer[1];
+    uint16_t pid = ((uint16_t)buffer[2] << 8) | buffer[3];
+    uint16_t len = ((uint16_t)buffer[4] << 8) | buffer[5];
+    uint8_t unitId = buffer[6];
+    uint8_t fc = buffer[7];
+
+    if (pid != 0x0000) {
+        LOG("Invalid Protocol ID: 0x%04x", pid);
+        return true;
+    }
+
+    if (tid != transactionId) {
+        LOG("Transaction ID mismatch: expected %u, got %u", transactionId, tid);
+        return true;
+    }
+
+    if (len != bytesRead - 6) {
+        LOG("Length mismatch: expected %u, got %d", len, bytesRead - 6);
+        return true;
+    }
+
+    // Check for exception response (bit 7 set)
+    if (fc & 0x80) {
+        uint8_t exceptionCode = buffer[8];
+        LOG("Modbus exception: fc=0x%02x, exception=0x%02x", fc, exceptionCode);
+        return true;
+    }
+
+    // Parse PDU for function code 0x03 (Read Holding or Input Registers or WriteSingleRegister)
+    if (fc == 0x03 || fc == 0x04 || fc == 0x06) {
+        uint16_t dataBytes = buffer[8];
+        if (bytesRead < 9 + dataBytes) {
+            LOG("Response data incomplete");
+            return true;
+        }
+
+        uint8_t* registerData = &buffer[9];
+        
+        // printf("[parseModbusTCPResponse] id 0x%02x fc 0x%02x len %u: 0x", unitId, fc, dataBytes);
+        // for (int i = 0; i < dataBytes; ++i) {
+        //     printf("%02x", registerData[i]);
+        // }
+        // printf("\n");
+
+        // Decode and publish each known register entry within the returned byte sequence.
+        // The response contains N registers (2 bytes each). We iterate through the
+        // aiswei register table starting from transactionAddr and dispatch each
+        // entry to decodeAndPublish with its appropriate byte slice.
+        size_t pos = 0;
+        while (pos + 1 < (size_t)dataBytes) {
+            uint16_t currentAddr = transactionAddr + (pos / 2);
+            int ridx = aiswei_find_register_index(currentAddr);
+            if (ridx < 0) {
+                // Unknown register: publish single 16-bit register as hex
+                uint8_t tmp[2]; tmp[0] = registerData[pos]; tmp[1] = registerData[pos+1];
+                decodeAndPublish(unitId, currentAddr, tmp, 2);
+                pos += 2;
+                continue;
+            }
+            uint16_t regs = aiswei_registers[ridx].length;
+            size_t bytesNeeded = regs * 2;
+            if (pos + bytesNeeded > (size_t)dataBytes) {
+                LOG("Response incomplete for addr %u: need %zu bytes, have %u", aiswei_registers[ridx].addr, bytesNeeded, dataBytes - (int)pos);
+                break;
+            }
+            decodeAndPublish(unitId, aiswei_registers[ridx].addr, &registerData[pos], bytesNeeded);
+            pos += bytesNeeded;
+        }
+    }
+    return true;
+}
+
 
 // Input register wrappers
-void deviceType(uint8_t slave) { requestAisweiRead(slave, 31001); }
-void modbusAddress(uint8_t slave) { requestAisweiRead(slave, 31002); }
-void serialNumber(uint8_t slave) { requestAisweiRead(slave, 31003); }
-void machineType(uint8_t slave) { requestAisweiRead(slave, 31019); }
-void currentGridCode(uint8_t slave) { requestAisweiRead(slave, 31027); }
-void ratedPower_W(uint8_t slave) { requestAisweiRead(slave, 31028); }
-void softwareVersion(uint8_t slave) { requestAisweiRead(slave, 31030); }
-void safetyVersion(uint8_t slave) { requestAisweiRead(slave, 31044); }
-void manufacturerName(uint8_t slave) { requestAisweiRead(slave, 31057); }
-void brandName(uint8_t slave) { requestAisweiRead(slave, 31065); }
+bool deviceType(uint8_t unitId) { return requestAisweiRead(unitId, 31001); }
+bool modbusAddress(uint8_t unitId) { return requestAisweiRead(unitId, 31002); }
+bool serialNumber(uint8_t unitId) { return requestAisweiRead(unitId, 31003); }
+bool machineType(uint8_t unitId) { return requestAisweiRead(unitId, 31019); }
+bool currentGridCode(uint8_t unitId) { return requestAisweiRead(unitId, 31027); }
+bool ratedPower_W(uint8_t unitId) { return requestAisweiRead(unitId, 31028); }
+bool softwareVersion(uint8_t unitId) { return requestAisweiRead(unitId, 31030); }
+bool safetyVersion(uint8_t unitId) { return requestAisweiRead(unitId, 31044); }
+bool manufacturerName(uint8_t unitId) { return requestAisweiRead(unitId, 31057); }
+bool brandName(uint8_t unitId) { return requestAisweiRead(unitId, 31065); }
 
-void gridRatedVoltage_V(uint8_t slave) { requestAisweiRead(slave, 31301); }
-void gridRatedFrequency_Hz(uint8_t slave) { requestAisweiRead(slave, 31302); }
-void eToday_kWh(uint8_t slave) { requestAisweiRead(slave, 31303); }
-void eTotal_kWh(uint8_t slave) { requestAisweiRead(slave, 31305); }
-void hTotal_H(uint8_t slave) { requestAisweiRead(slave, 31307); }
-void deviceState(uint8_t slave) { requestAisweiRead(slave, 31309); }
-void connectTime_s(uint8_t slave) { requestAisweiRead(slave, 31310); }
+bool gridRatedVoltage_V(uint8_t unitId) { return requestAisweiRead(unitId, 31301); }
+bool gridRatedFrequency_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 31302); }
+bool eToday_kWh(uint8_t unitId) { return requestAisweiRead(unitId, 31303); }
+bool eTotal_kWh(uint8_t unitId) { return requestAisweiRead(unitId, 31305); }
+bool hTotal_H(uint8_t unitId) { return requestAisweiRead(unitId, 31307); }
+bool deviceState(uint8_t unitId) { return requestAisweiRead(unitId, 31309); }
+bool connectTime_s(uint8_t unitId) { return requestAisweiRead(unitId, 31310); }
 
-void airTemperature_C(uint8_t slave) { requestAisweiRead(slave, 31311); }
-void inverterUphaseTemperature_C(uint8_t slave) { requestAisweiRead(slave, 31312); }
-void inverterVphaseTemperature_C(uint8_t slave) { requestAisweiRead(slave, 31313); }
-void inverterWphaseTemperature_C(uint8_t slave) { requestAisweiRead(slave, 31314); }
-void boostTemperature_C(uint8_t slave) { requestAisweiRead(slave, 31315); }
-void bidirectionalDCDCtemperature_C(uint8_t slave) { requestAisweiRead(slave, 31316);}
-void busVoltage_V(uint8_t slave) { requestAisweiRead(slave, 31317); }
+bool airTemperature_C(uint8_t unitId) { return requestAisweiRead(unitId, 31311); }
+bool inverterUphaseTemperature_C(uint8_t unitId) { return requestAisweiRead(unitId, 31312); }
+bool inverterVphaseTemperature_C(uint8_t unitId) { return requestAisweiRead(unitId, 31313); }
+bool inverterWphaseTemperature_C(uint8_t unitId) { return requestAisweiRead(unitId, 31314); }
+bool boostTemperature_C(uint8_t unitId) { return requestAisweiRead(unitId, 31315); }
+bool bidirectionalDCDCtemperature_C(uint8_t unitId) { return requestAisweiRead(unitId, 31316);}
+bool busVoltage_V(uint8_t unitId) { return requestAisweiRead(unitId, 31317); }
 
-void pv1Voltage_V(uint8_t slave) { requestAisweiRead(slave, 31319); }
-void pv1Current_A(uint8_t slave) { requestAisweiRead(slave, 31320); }
-void pv2Voltage_V(uint8_t slave) { requestAisweiRead(slave, 31321); }
-void pv2Current_A(uint8_t slave) { requestAisweiRead(slave, 31322); }
-void pv3Voltage_V(uint8_t slave) { requestAisweiRead(slave, 31323); }
-void pv3Current_A(uint8_t slave) { requestAisweiRead(slave, 31324); }
-void pv4Voltage_V(uint8_t slave) { requestAisweiRead(slave, 31325); }
-void pv4Current_A(uint8_t slave) { requestAisweiRead(slave, 31326); }
-void pv5Voltage_V(uint8_t slave) { requestAisweiRead(slave, 31327); }
-void pv5Current_A(uint8_t slave) { requestAisweiRead(slave, 31328); }
+bool pv1Voltage_V(uint8_t unitId) { return requestAisweiRead(unitId, 31319); }
+bool pv1Current_A(uint8_t unitId) { return requestAisweiRead(unitId, 31320); }
+bool pv2Voltage_V(uint8_t unitId) { return requestAisweiRead(unitId, 31321); }
+bool pv2Current_A(uint8_t unitId) { return requestAisweiRead(unitId, 31322); }
+bool pv3Voltage_V(uint8_t unitId) { return requestAisweiRead(unitId, 31323); }
+bool pv3Current_A(uint8_t unitId) { return requestAisweiRead(unitId, 31324); }
+bool pv4Voltage_V(uint8_t unitId) { return requestAisweiRead(unitId, 31325); }
+bool pv4Current_A(uint8_t unitId) { return requestAisweiRead(unitId, 31326); }
+bool pv5Voltage_V(uint8_t unitId) { return requestAisweiRead(unitId, 31327); }
+bool pv5Current_A(uint8_t unitId) { return requestAisweiRead(unitId, 31328); }
 
-void string1Current_A(uint8_t slave) { requestAisweiRead(slave, 31339); }
-void string2Current_A(uint8_t slave) { requestAisweiRead(slave, 31340); }
-void string3Current_A(uint8_t slave) { requestAisweiRead(slave, 31341); }
-void string4Current_A(uint8_t slave) { requestAisweiRead(slave, 31342); }
-void string5Current_A(uint8_t slave) { requestAisweiRead(slave, 31343); }
-void string6Current_A(uint8_t slave) { requestAisweiRead(slave, 31344); }
-void string7Current_A(uint8_t slave) { requestAisweiRead(slave, 31345); }
-void string8Current_A(uint8_t slave) { requestAisweiRead(slave, 31346); }
-void string9Current_A(uint8_t slave) { requestAisweiRead(slave, 31347); }
-void string10Current_A(uint8_t slave) { requestAisweiRead(slave, 31348); }
+bool string1Current_A(uint8_t unitId) { return requestAisweiRead(unitId, 31339); }
+bool string2Current_A(uint8_t unitId) { return requestAisweiRead(unitId, 31340); }
+bool string3Current_A(uint8_t unitId) { return requestAisweiRead(unitId, 31341); }
+bool string4Current_A(uint8_t unitId) { return requestAisweiRead(unitId, 31342); }
+bool string5Current_A(uint8_t unitId) { return requestAisweiRead(unitId, 31343); }
+bool string6Current_A(uint8_t unitId) { return requestAisweiRead(unitId, 31344); }
+bool string7Current_A(uint8_t unitId) { return requestAisweiRead(unitId, 31345); }
+bool string8Current_A(uint8_t unitId) { return requestAisweiRead(unitId, 31346); }
+bool string9Current_A(uint8_t unitId) { return requestAisweiRead(unitId, 31347); }
+bool string10Current_A(uint8_t unitId) { return requestAisweiRead(unitId, 31348); }
 
-void L1PhaseVoltage_V(uint8_t slave) { requestAisweiRead(slave, 31359); }
-void L1PhaseCurrent_A(uint8_t slave) { requestAisweiRead(slave, 31360); }
-void L2PhaseVoltage_V(uint8_t slave) { requestAisweiRead(slave, 31361); }
-void L2PhaseCurrent_A(uint8_t slave) { requestAisweiRead(slave, 31362); }
-void L3PhaseVoltage_V(uint8_t slave) { requestAisweiRead(slave, 31363); }
-void L3PhaseCurrent_A(uint8_t slave) { requestAisweiRead(slave, 31364); }
-void RSLineVoltage_V(uint8_t slave) { requestAisweiRead(slave, 31365); }
-void RTLineVoltage_V(uint8_t slave) { requestAisweiRead(slave, 31366); }
-void STLineVoltage_V(uint8_t slave) { requestAisweiRead(slave, 31367); }
+bool L1PhaseVoltage_V(uint8_t unitId) { return requestAisweiRead(unitId, 31359); }
+bool L1PhaseCurrent_A(uint8_t unitId) { return requestAisweiRead(unitId, 31360); }
+bool L2PhaseVoltage_V(uint8_t unitId) { return requestAisweiRead(unitId, 31361); }
+bool L2PhaseCurrent_A(uint8_t unitId) { return requestAisweiRead(unitId, 31362); }
+bool L3PhaseVoltage_V(uint8_t unitId) { return requestAisweiRead(unitId, 31363); }
+bool L3PhaseCurrent_A(uint8_t unitId) { return requestAisweiRead(unitId, 31364); }
+bool RSLineVoltage_V(uint8_t unitId) { return requestAisweiRead(unitId, 31365); }
+bool RTLineVoltage_V(uint8_t unitId) { return requestAisweiRead(unitId, 31366); }
+bool STLineVoltage_V(uint8_t unitId) { return requestAisweiRead(unitId, 31367); }
 
-void gridFrequency_Hz(uint8_t slave) { requestAisweiRead(slave, 31368); }
-void apparentPower_VA(uint8_t slave) { requestAisweiRead(slave, 31369); }
-void activePower_W(uint8_t slave) { requestAisweiRead(slave, 31371); }
-void reactivePower_Var(uint8_t slave) { requestAisweiRead(slave, 31373); }
-void powerFactor(uint8_t slave) { requestAisweiRead(slave, 31375); }
+bool gridFrequency_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 31368); }
+bool apparentPower_VA(uint8_t unitId) { return requestAisweiRead(unitId, 31369); }
+bool activePower_W(uint8_t unitId) { return requestAisweiRead(unitId, 31371); }
+bool reactivePower_Var(uint8_t unitId) { return requestAisweiRead(unitId, 31373); }
+bool powerFactor(uint8_t unitId) { return requestAisweiRead(unitId, 31375); }
 
-void errorCode(uint8_t slave) { requestAisweiRead(slave, 31378); }
-void warningCode(uint8_t slave) { requestAisweiRead(slave, 31379); }
+bool errorCode(uint8_t unitId) { return requestAisweiRead(unitId, 31378); }
+bool warningCode(uint8_t unitId) { return requestAisweiRead(unitId, 31379); }
 
-void pvTotalPower_W(uint8_t slave) { requestAisweiRead(slave, 31601); }
-void pvEToday_kWh(uint8_t slave) { requestAisweiRead(slave, 31603); }
-void pvETotal_kWh(uint8_t slave) { requestAisweiRead(slave, 31605); }
-void batteryCommunicationStatus(uint8_t slave) { requestAisweiRead(slave, 31607); }
-void batteryStatus(uint8_t slave) { requestAisweiRead(slave, 31608); }
-void batteryErrorStatus(uint8_t slave) { requestAisweiRead(slave, 31609); }
-void batteryWarningStatus(uint8_t slave) { requestAisweiRead(slave, 31613); }
-void batteryVoltage_V(uint8_t slave) { requestAisweiRead(slave, 31617); }
-void batteryCurrent_A(uint8_t slave) { requestAisweiRead(slave, 31618); }
-void batteryPower_W(uint8_t slave) { requestAisweiRead(slave, 31619); }
-void batteryTemperature_C(uint8_t slave) { requestAisweiRead(slave, 31621); }
-void batterySOC(uint8_t slave) { requestAisweiRead(slave, 31622); }
-void batterySOH(uint8_t slave) { requestAisweiRead(slave, 31623); }
-void batteryChargingCurrentLimit_A(uint8_t slave) { requestAisweiRead(slave, 31624); }
-void batteryDischargeCurrentLimit_A(uint8_t slave) { requestAisweiRead(slave, 31625); }
-void batteryEChargeToday_kWh(uint8_t slave) { requestAisweiRead(slave, 31626); }
-void batteryEDischargeToday_kWh(uint8_t slave) { requestAisweiRead(slave, 31628); }
-void eConsumptionToday_AC_kWh(uint8_t slave) { requestAisweiRead(slave, 31630); }
-void eGenerationToday_AC_kWh(uint8_t slave) { requestAisweiRead(slave, 31632); }
-void EPSLoadVoltage_V(uint8_t slave) { requestAisweiRead(slave, 31634); }
-void EPSLoadCurrent_A(uint8_t slave) { requestAisweiRead(slave, 31635); }
-void EPSLoadFrequency_Hz(uint8_t slave) { requestAisweiRead(slave, 31636); }
-void EPSLoadActivePower_W(uint8_t slave) { requestAisweiRead(slave, 31637); }
-void EPSLoadReactivePower_Var(uint8_t slave) { requestAisweiRead(slave, 31639); }
-void eConsumptionToday_EPS_kWh(uint8_t slave) { requestAisweiRead(slave, 31641); }
-void eConsumptionTotal_EPS_kWh(uint8_t slave) { requestAisweiRead(slave, 31643); }
+bool pvTotalPower_W(uint8_t unitId) { return requestAisweiRead(unitId, 31601); }
+bool pvEToday_kWh(uint8_t unitId) { return requestAisweiRead(unitId, 31603); }
+bool pvETotal_kWh(uint8_t unitId) { return requestAisweiRead(unitId, 31605); }
+bool batteryCommunicationStatus(uint8_t unitId) { return requestAisweiRead(unitId, 31607); }
+bool batteryStatus(uint8_t unitId) { return requestAisweiRead(unitId, 31608); }
+bool batteryErrorStatus(uint8_t unitId) { return requestAisweiRead(unitId, 31609); }
+bool batteryWarningStatus(uint8_t unitId) { return requestAisweiRead(unitId, 31613); }
+bool batteryVoltage_V(uint8_t unitId) { return requestAisweiRead(unitId, 31617); }
+bool batteryCurrent_A(uint8_t unitId) { return requestAisweiRead(unitId, 31618); }
+bool batteryPower_W(uint8_t unitId) { return requestAisweiRead(unitId, 31619); }
+bool batteryTemperature_C(uint8_t unitId) { return requestAisweiRead(unitId, 31621); }
+bool batterySOC(uint8_t unitId) { return requestAisweiRead(unitId, 31622); }
+bool batterySOH(uint8_t unitId) { return requestAisweiRead(unitId, 31623); }
+bool batteryChargingCurrentLimit_A(uint8_t unitId) { return requestAisweiRead(unitId, 31624); }
+bool batteryDischargeCurrentLimit_A(uint8_t unitId) { return requestAisweiRead(unitId, 31625); }
+bool batteryEChargeToday_kWh(uint8_t unitId) { return requestAisweiRead(unitId, 31626); }
+bool batteryEDischargeToday_kWh(uint8_t unitId) { return requestAisweiRead(unitId, 31628); }
+bool eConsumptionToday_AC_kWh(uint8_t unitId) { return requestAisweiRead(unitId, 31630); }
+bool eGenerationToday_AC_kWh(uint8_t unitId) { return requestAisweiRead(unitId, 31632); }
+bool EPSLoadVoltage_V(uint8_t unitId) { return requestAisweiRead(unitId, 31634); }
+bool EPSLoadCurrent_A(uint8_t unitId) { return requestAisweiRead(unitId, 31635); }
+bool EPSLoadFrequency_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 31636); }
+bool EPSLoadActivePower_W(uint8_t unitId) { return requestAisweiRead(unitId, 31637); }
+bool EPSLoadReactivePower_Var(uint8_t unitId) { return requestAisweiRead(unitId, 31639); }
+bool eConsumptionToday_EPS_kWh(uint8_t unitId) { return requestAisweiRead(unitId, 31641); }
+bool eConsumptionTotal_EPS_kWh(uint8_t unitId) { return requestAisweiRead(unitId, 31643); }
 
 // Holding register wrappers
-void remoteSwitchCommand(uint8_t slave) { requestAisweiRead(slave, 40201); }
-void rtc_Year(uint8_t slave) { requestAisweiRead(slave, 41001); }
-void rtc_Month(uint8_t slave) { requestAisweiRead(slave, 41002); }
-void rtc_Day(uint8_t slave) { requestAisweiRead(slave, 41003); }
-void rtc_Hour(uint8_t slave) { requestAisweiRead(slave, 41004); }
-void rtc_Minute(uint8_t slave) { requestAisweiRead(slave, 41005); }
-void rtc_Seconds(uint8_t slave) { requestAisweiRead(slave, 41006); }
+bool remoteSwitchCommand(uint8_t unitId) { return requestAisweiRead(unitId, 40201); }
+bool rtc_Year(uint8_t unitId) { return requestAisweiRead(unitId, 41001); }
+bool rtc_Month(uint8_t unitId) { return requestAisweiRead(unitId, 41002); }
+bool rtc_Day(uint8_t unitId) { return requestAisweiRead(unitId, 41003); }
+bool rtc_Hour(uint8_t unitId) { return requestAisweiRead(unitId, 41004); }
+bool rtc_Minute(uint8_t unitId) { return requestAisweiRead(unitId, 41005); }
+bool rtc_Seconds(uint8_t unitId) { return requestAisweiRead(unitId, 41006); }
 
-void storageInverterSwitch(uint8_t slave) { requestAisweiRead(slave, 41102); }
-void typeSelectionOfEnergyStorageMachine(uint8_t slave) { requestAisweiRead(slave, 41103); }
-void runMode(uint8_t slave) { requestAisweiRead(slave, 41104); }
-void batteryManufacturer(uint8_t slave) { requestAisweiRead(slave, 41105); }
-void smartMeterStatus(uint8_t slave) { requestAisweiRead(slave, 41108); }
-void smartMeterAdjustmentFlag(uint8_t slave) { requestAisweiRead(slave, 41109); }
-void setTargetPowerValue_W(uint8_t slave) { requestAisweiRead(slave, 41110); }
-void currentPowerValueOfSmartMeter_W(uint8_t slave) { requestAisweiRead(slave, 41112); }
-void antiReverseCurrentFlag(uint8_t slave) { requestAisweiRead(slave, 41114); }
-void batteryWakeUp(uint8_t slave) { requestAisweiRead(slave, 41115); }
-void commboxAndCloudCommunicationStatus(uint8_t slave) { requestAisweiRead(slave, 41151); }
-void chargeDischargeFlagBit(uint8_t slave) { requestAisweiRead(slave, 41152); }
-void chargeAndDischargePowerCommand_W(uint8_t slave) { requestAisweiRead(slave, 41153); }
+bool storageInverterSwitch(uint8_t unitId) { return requestAisweiRead(unitId, 41102); }
+bool typeSelectionOfEnergyStorageMachine(uint8_t unitId) { return requestAisweiRead(unitId, 41103); }
+bool runMode(uint8_t unitId) { return requestAisweiRead(unitId, 41104); }
+bool batteryManufacturer(uint8_t unitId) { return requestAisweiRead(unitId, 41105); }
+bool smartMeterStatus(uint8_t unitId) { return requestAisweiRead(unitId, 41108); }
+bool smartMeterAdjustmentFlag(uint8_t unitId) { return requestAisweiRead(unitId, 41109); }
+bool setTargetPowerValue_W(uint8_t unitId) { return requestAisweiRead(unitId, 41110); }
+bool currentPowerValueOfSmartMeter_W(uint8_t unitId) { return requestAisweiRead(unitId, 41112); }
+bool antiReverseCurrentFlag(uint8_t unitId) { return requestAisweiRead(unitId, 41114); }
+bool batteryWakeUp(uint8_t unitId) { return requestAisweiRead(unitId, 41115); }
+bool commboxAndCloudCommunicationStatus(uint8_t unitId) { return requestAisweiRead(unitId, 41151); }
+bool chargeDischargeFlagBit(uint8_t unitId) { return requestAisweiRead(unitId, 41152); }
+bool chargeAndDischargePowerCommand_W(uint8_t unitId) { return requestAisweiRead(unitId, 41153); }
 
-void activePowerControlFunction(uint8_t slave) { requestAisweiRead(slave, 44001); }
-void eegControlFunction(uint8_t slave) { requestAisweiRead(slave, 44002); }
-void slopeLoadFunction(uint8_t slave) { requestAisweiRead(slave, 44003); }
-void overvoltageReducePowerFunction(uint8_t slave) { requestAisweiRead(slave, 44004); }
-void overfrequencyReducePowerFunction(uint8_t slave) { requestAisweiRead(slave, 44005); }
-void reactivePowerControlFunction(uint8_t slave) { requestAisweiRead(slave, 44006); }
-void LVRTFunction(uint8_t slave) { requestAisweiRead(slave, 44007); }
-void tenMinutesAverageOvervoltageProtectFunction(uint8_t slave) { requestAisweiRead(slave, 44009); }
-void islandingProtectFunction(uint8_t slave) { requestAisweiRead(slave, 44010); }
-void peConnectionCheckFunction(uint8_t slave) { requestAisweiRead(slave, 44012); }
-void overloadFunction(uint8_t slave) { requestAisweiRead(slave, 44017); }
-void shadowMPPTFunction(uint8_t slave) { requestAisweiRead(slave, 44025); }
+bool activePowerControlFunction(uint8_t unitId) { return requestAisweiRead(unitId, 44001); }
+bool eegControlFunction(uint8_t unitId) { return requestAisweiRead(unitId, 44002); }
+bool slopeLoadFunction(uint8_t unitId) { return requestAisweiRead(unitId, 44003); }
+bool overvoltageReducePowerFunction(uint8_t unitId) { return requestAisweiRead(unitId, 44004); }
+bool overfrequencyReducePowerFunction(uint8_t unitId) { return requestAisweiRead(unitId, 44005); }
+bool reactivePowerControlFunction(uint8_t unitId) { return requestAisweiRead(unitId, 44006); }
+bool LVRTFunction(uint8_t unitId) { return requestAisweiRead(unitId, 44007); }
+bool tenMinutesAverageOvervoltageProtectFunction(uint8_t unitId) { return requestAisweiRead(unitId, 44009); }
+bool islandingProtectFunction(uint8_t unitId) { return requestAisweiRead(unitId, 44010); }
+bool peConnectionCheckFunction(uint8_t unitId) { return requestAisweiRead(unitId, 44012); }
+bool overloadFunction(uint8_t unitId) { return requestAisweiRead(unitId, 44017); }
+bool shadowMPPTFunction(uint8_t unitId) { return requestAisweiRead(unitId, 44025); }
 
-void gridCode(uint8_t slave) { requestAisweiRead(slave, 45201); }
-void overvoltageProtectionValue3_V(uint8_t slave) { requestAisweiRead(slave, 45202); }
-void overvoltageProtectionValue2_V(uint8_t slave) { requestAisweiRead(slave, 45203); }
-void overvoltageProtectionValueFreq_Hz(uint8_t slave) { requestAisweiRead(slave, 45204); }
-void underfrequencyProtectionValue_Hz(uint8_t slave) { requestAisweiRead(slave, 45205); }
-void gridVoltageHighLimit3_V(uint8_t slave) { requestAisweiRead(slave, 45206); }
-void gridVoltageHighLimitTime3_ms(uint8_t slave) { requestAisweiRead(slave, 45207); }
-void gridVoltageHighLimit2_V(uint8_t slave) { requestAisweiRead(slave, 45209); }
-void gridVoltageHighLimitTime2_ms(uint8_t slave) { requestAisweiRead(slave, 45210); }
-void gridVoltageHighLimit1_V(uint8_t slave) { requestAisweiRead(slave, 45212); }
-void gridVoltageHighLimitTime1_ms(uint8_t slave) { requestAisweiRead(slave, 45213); }
-void gridVoltageLowLimit3_V(uint8_t slave) { requestAisweiRead(slave, 45215); }
-void gridVoltageLowLimitTime3_ms(uint8_t slave) { requestAisweiRead(slave, 45216); }
-void gridVoltageLowLimit2_V(uint8_t slave) { requestAisweiRead(slave, 45218); }
-void gridVoltageLowLimitTime2_ms(uint8_t slave) { requestAisweiRead(slave, 45219); }
-void gridVoltageLowLimit1_V(uint8_t slave) { requestAisweiRead(slave, 45221); }
-void gridVoltageLowLimitTime1_ms(uint8_t slave) { requestAisweiRead(slave, 45222); }
-void tenMinutesAverageOvervoltageThreshold_V(uint8_t slave) { requestAisweiRead(slave, 45224); }
-void tenMinutesAverageOvervoltageProtectTime_ms(uint8_t slave) { requestAisweiRead(slave, 45225); }
-void overvoltageRecoverValue_V(uint8_t slave) { requestAisweiRead(slave, 45226); }
-void undervoltageRecoverValue_V(uint8_t slave) { requestAisweiRead(slave, 45227); }
-void gridFrequencyHighLimit3_Hz(uint8_t slave) { requestAisweiRead(slave, 45228); }
-void gridFrequencyHighLimitTime3_ms(uint8_t slave) { requestAisweiRead(slave, 45229); }
-void gridFrequencyHighLimit2_Hz(uint8_t slave) { requestAisweiRead(slave, 45231); }
-void gridFrequencyHighLimitTime2_ms(uint8_t slave) { requestAisweiRead(slave, 45232); }
-void gridFrequencyHighLimit1_Hz(uint8_t slave) { requestAisweiRead(slave, 45234); }
-void gridFrequencyHighLimitTime1_ms(uint8_t slave) { requestAisweiRead(slave, 45235); }
-void gridFrequencyLowLimit3_Hz(uint8_t slave) { requestAisweiRead(slave, 45237); }
-void gridFrequencyLowLimitTime3_ms(uint8_t slave) { requestAisweiRead(slave, 45238); }
-void gridFrequencyLowLimit2_Hz(uint8_t slave) { requestAisweiRead(slave, 45240); }
-void gridFrequencyLowLimitTime2_ms(uint8_t slave) { requestAisweiRead(slave, 45241); }
-void gridFrequencyLowLimit1_Hz(uint8_t slave) { requestAisweiRead(slave, 45243); }
-void gridFrequencyLowLimitTime1_ms(uint8_t slave) { requestAisweiRead(slave, 45244); }
-void varyRateOfFrequencyProtectValue_HzPerS(uint8_t slave) { requestAisweiRead(slave, 45246); }
-void varyRateOfFrequencyProtectTime_ms(uint8_t slave) { requestAisweiRead(slave, 45247); }
-void overfrequencyRecoverValue_Hz(uint8_t slave) { requestAisweiRead(slave, 45249); }
-void underfrequencyRecoverValue_Hz(uint8_t slave) { requestAisweiRead(slave, 45250); }
-void timeOfFirstConnectionToGrid_s(uint8_t slave) { requestAisweiRead(slave, 45251); }
-void timeOfReconnectionToGrid_s(uint8_t slave) { requestAisweiRead(slave, 45252); }
-void isoProtectThreshold_kOhm(uint8_t slave) { requestAisweiRead(slave, 45253); }
-void dciProtectThreshold_mA(uint8_t slave) { requestAisweiRead(slave, 45254); }
-void dciProtectTime_ms(uint8_t slave) { requestAisweiRead(slave, 45255); }
+bool gridCode(uint8_t unitId) { return requestAisweiRead(unitId, 45201); }
+bool overvoltageProtectionValue3_V(uint8_t unitId) { return requestAisweiRead(unitId, 45202); }
+bool overvoltageProtectionValue2_V(uint8_t unitId) { return requestAisweiRead(unitId, 45203); }
+bool overvoltageProtectionValueFreq_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45204); }
+bool underfrequencyProtectionValue_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45205); }
+bool gridVoltageHighLimit3_V(uint8_t unitId) { return requestAisweiRead(unitId, 45206); }
+bool gridVoltageHighLimitTime3_ms(uint8_t unitId) { return requestAisweiRead(unitId, 45207); }
+bool gridVoltageHighLimit2_V(uint8_t unitId) { return requestAisweiRead(unitId, 45209); }
+bool gridVoltageHighLimitTime2_ms(uint8_t unitId) { return requestAisweiRead(unitId, 45210); }
+bool gridVoltageHighLimit1_V(uint8_t unitId) { return requestAisweiRead(unitId, 45212); }
+bool gridVoltageHighLimitTime1_ms(uint8_t unitId) { return requestAisweiRead(unitId, 45213); }
+bool gridVoltageLowLimit3_V(uint8_t unitId) { return requestAisweiRead(unitId, 45215); }
+bool gridVoltageLowLimitTime3_ms(uint8_t unitId) { return requestAisweiRead(unitId, 45216); }
+bool gridVoltageLowLimit2_V(uint8_t unitId) { return requestAisweiRead(unitId, 45218); }
+bool gridVoltageLowLimitTime2_ms(uint8_t unitId) { return requestAisweiRead(unitId, 45219); }
+bool gridVoltageLowLimit1_V(uint8_t unitId) { return requestAisweiRead(unitId, 45221); }
+bool gridVoltageLowLimitTime1_ms(uint8_t unitId) { return requestAisweiRead(unitId, 45222); }
+bool tenMinutesAverageOvervoltageThreshold_V(uint8_t unitId) { return requestAisweiRead(unitId, 45224); }
+bool tenMinutesAverageOvervoltageProtectTime_ms(uint8_t unitId) { return requestAisweiRead(unitId, 45225); }
+bool overvoltageRecoverValue_V(uint8_t unitId) { return requestAisweiRead(unitId, 45226); }
+bool undervoltageRecoverValue_V(uint8_t unitId) { return requestAisweiRead(unitId, 45227); }
+bool gridFrequencyHighLimit3_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45228); }
+bool gridFrequencyHighLimitTime3_ms(uint8_t unitId) { return requestAisweiRead(unitId, 45229); }
+bool gridFrequencyHighLimit2_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45231); }
+bool gridFrequencyHighLimitTime2_ms(uint8_t unitId) { return requestAisweiRead(unitId, 45232); }
+bool gridFrequencyHighLimit1_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45234); }
+bool gridFrequencyHighLimitTime1_ms(uint8_t unitId) { return requestAisweiRead(unitId, 45235); }
+bool gridFrequencyLowLimit3_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45237); }
+bool gridFrequencyLowLimitTime3_ms(uint8_t unitId) { return requestAisweiRead(unitId, 45238); }
+bool gridFrequencyLowLimit2_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45240); }
+bool gridFrequencyLowLimitTime2_ms(uint8_t unitId) { return requestAisweiRead(unitId, 45241); }
+bool gridFrequencyLowLimit1_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45243); }
+bool gridFrequencyLowLimitTime1_ms(uint8_t unitId) { return requestAisweiRead(unitId, 45244); }
+bool varyRateOfFrequencyProtectValue_HzPerS(uint8_t unitId) { return requestAisweiRead(unitId, 45246); }
+bool varyRateOfFrequencyProtectTime_ms(uint8_t unitId) { return requestAisweiRead(unitId, 45247); }
+bool overfrequencyRecoverValue_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45249); }
+bool underfrequencyRecoverValue_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45250); }
+bool timeOfFirstConnectionToGrid_s(uint8_t unitId) { return requestAisweiRead(unitId, 45251); }
+bool timeOfReconnectionToGrid_s(uint8_t unitId) { return requestAisweiRead(unitId, 45252); }
+bool isoProtectThreshold_kOhm(uint8_t unitId) { return requestAisweiRead(unitId, 45253); }
+bool dciProtectThreshold_mA(uint8_t unitId) { return requestAisweiRead(unitId, 45254); }
+bool dciProtectTime_ms(uint8_t unitId) { return requestAisweiRead(unitId, 45255); }
 
-void loadRateOfFirstConnectionToGrid(uint8_t slave) { requestAisweiRead(slave, 45401); }
-void loadRateOfReconnectionToGrid(uint8_t slave) { requestAisweiRead(slave, 45402); }
-void activePowerSet_percentPn(uint8_t slave) { requestAisweiRead(slave, 45403); }
-void increaseRateOfActivePower_percentPnPerMin(uint8_t slave) { requestAisweiRead(slave, 45404); }
-void decreaseRateOfActivePower_percentPnPerMin(uint8_t slave) { requestAisweiRead(slave, 45405); }
-void overFrequencyReducePowerMode(uint8_t slave) { requestAisweiRead(slave, 45408); }
-void overFrequencyReducePowerStartFrequency_Hz(uint8_t slave) { requestAisweiRead(slave, 45409); }
-void overFrequencyReducePowerStopFrequency_Hz(uint8_t slave) { requestAisweiRead(slave, 45410); }
-void overFrequencyReducePowerBackFrequency_Hz(uint8_t slave) { requestAisweiRead(slave, 45411); }
-void reduceRatioOfOverFrequencyReducePower(uint8_t slave) { requestAisweiRead(slave, 45412); }
-void overFrequencyReducePowerReduceDelayTime_s(uint8_t slave) { requestAisweiRead(slave, 45413); }
-void overFrequencyReducePowerRecoverDelayTime_s(uint8_t slave) { requestAisweiRead(slave, 45414); }
-void speedOfOverFrequencyRecoverToPn(uint8_t slave) { requestAisweiRead(slave, 45416); }
-void overFrequencyZeroPowerFrequencyPoint_Hz(uint8_t slave) { requestAisweiRead(slave, 45417); }
+bool loadRateOfFirstConnectionToGrid(uint8_t unitId) { return requestAisweiRead(unitId, 45401); }
+bool loadRateOfReconnectionToGrid(uint8_t unitId) { return requestAisweiRead(unitId, 45402); }
+bool activePowerSet_percentPn(uint8_t unitId) { return requestAisweiRead(unitId, 45403); }
+bool increaseRateOfActivePower_percentPnPerMin(uint8_t unitId) { return requestAisweiRead(unitId, 45404); }
+bool decreaseRateOfActivePower_percentPnPerMin(uint8_t unitId) { return requestAisweiRead(unitId, 45405); }
+bool overFrequencyReducePowerMode(uint8_t unitId) { return requestAisweiRead(unitId, 45408); }
+bool overFrequencyReducePowerStartFrequency_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45409); }
+bool overFrequencyReducePowerStopFrequency_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45410); }
+bool overFrequencyReducePowerBackFrequency_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45411); }
+bool reduceRatioOfOverFrequencyReducePower(uint8_t unitId) { return requestAisweiRead(unitId, 45412); }
+bool overFrequencyReducePowerReduceDelayTime_s(uint8_t unitId) { return requestAisweiRead(unitId, 45413); }
+bool overFrequencyReducePowerRecoverDelayTime_s(uint8_t unitId) { return requestAisweiRead(unitId, 45414); }
+bool speedOfOverFrequencyRecoverToPn(uint8_t unitId) { return requestAisweiRead(unitId, 45416); }
+bool overFrequencyZeroPowerFrequencyPoint_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45417); }
 
-void overVoltageReducePowerMode(uint8_t slave) { requestAisweiRead(slave, 45419); }
-void overVoltageReducePowerStartVoltage_percentUn(uint8_t slave) { requestAisweiRead(slave, 45420); }
-void overVoltageReducePowerStopVoltage_percentUn(uint8_t slave) { requestAisweiRead(slave, 45422); }
-void overVoltageReducePowerBackVoltage_percentUn(uint8_t slave) { requestAisweiRead(slave, 45424); }
-void reduceRatioOfOverVoltageReducePower(uint8_t slave) { requestAisweiRead(slave, 45426); }
-void overVoltageReducePowerDelayTime_s(uint8_t slave) { requestAisweiRead(slave, 45427); }
-void overVoltageRecoverPowerDelayTime_s(uint8_t slave) { requestAisweiRead(slave, 45428); }
-void speedOfOverVoltageRecoverToPn(uint8_t slave) { requestAisweiRead(slave, 45429); }
+bool overVoltageReducePowerMode(uint8_t unitId) { return requestAisweiRead(unitId, 45419); }
+bool overVoltageReducePowerStartVoltage_percentUn(uint8_t unitId) { return requestAisweiRead(unitId, 45420); }
+bool overVoltageReducePowerStopVoltage_percentUn(uint8_t unitId) { return requestAisweiRead(unitId, 45422); }
+bool overVoltageReducePowerBackVoltage_percentUn(uint8_t unitId) { return requestAisweiRead(unitId, 45424); }
+bool reduceRatioOfOverVoltageReducePower(uint8_t unitId) { return requestAisweiRead(unitId, 45426); }
+bool overVoltageReducePowerDelayTime_s(uint8_t unitId) { return requestAisweiRead(unitId, 45427); }
+bool overVoltageRecoverPowerDelayTime_s(uint8_t unitId) { return requestAisweiRead(unitId, 45428); }
+bool speedOfOverVoltageRecoverToPn(uint8_t unitId) { return requestAisweiRead(unitId, 45429); }
 
-void underFrequencyIncreasePowerMode(uint8_t slave) { requestAisweiRead(slave, 45432); }
+bool underFrequencyIncreasePowerMode(uint8_t unitId) { return requestAisweiRead(unitId, 45432); }
+bool underFrequencyIncreasePowerStartFrequency_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45433); }
+bool underFrequencyIncreasePowerStopFrequency_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45434); }
+bool underFrequencyIncreasePowerBackFrequency_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45435); }
+bool increaseRatioOfUnderFrequencyIncreasePower(uint8_t unitId) { return requestAisweiRead(unitId, 45436); }
+bool underFrequencyIncreasePowerDelayTime_s(uint8_t unitId) { return requestAisweiRead(unitId, 45437); }
+bool underFrequencyRecoverPowerDelayTime_s(uint8_t unitId) { return requestAisweiRead(unitId, 45438); }
+bool speedOfUnderFrequencyRecoverToPn(uint8_t unitId) { return requestAisweiRead(unitId, 45440); }
+bool underFrequencyZeroPowerFrequencyPoint_Hz(uint8_t unitId) { return requestAisweiRead(unitId, 45441); }
 
-void underFrequencyIncreasePowerStartFrequency_Hz(uint8_t slave) { requestAisweiRead(slave, 45433); }
-void underFrequencyIncreasePowerStopFrequency_Hz(uint8_t slave)  { requestAisweiRead(slave, 45434); }
-void underFrequencyIncreasePowerBackFrequency_Hz(uint8_t slave)  { requestAisweiRead(slave, 45435); }
-void increaseRatioOfUnderFrequencyIncreasePower(uint8_t slave)    { requestAisweiRead(slave, 45436); }
-void underFrequencyIncreasePowerDelayTime_s(uint8_t slave)       { requestAisweiRead(slave, 45437); }
-void underFrequencyRecoverPowerDelayTime_s(uint8_t slave)        { requestAisweiRead(slave, 45438); }
-void speedOfUnderFrequencyRecoverToPn(uint8_t slave)             { requestAisweiRead(slave, 45440); }
-void underFrequencyZeroPowerFrequencyPoint_Hz(uint8_t slave)     { requestAisweiRead(slave, 45441); }
+bool underVoltageIncreasePowerMode(uint8_t unitId) { return requestAisweiRead(unitId, 45443); }
+bool underVoltageIncreasePowerStartVoltage_percentUn(uint8_t unitId) { return requestAisweiRead(unitId, 45444); }
+bool underVoltageIncreasePowerStopVoltage_percentUn(uint8_t unitId) { return requestAisweiRead(unitId, 45445); }
+bool underVoltageIncreasePowerBackVoltage_percentUn(uint8_t unitId) { return requestAisweiRead(unitId, 45446); }
+bool increaseRatioOfUnderVoltageIncreasePower(uint8_t unitId) { return requestAisweiRead(unitId, 45447); }
+bool underVoltageIncreasePowerDelayTime_s(uint8_t unitId) { return requestAisweiRead(unitId, 45448); }
+bool underVoltageIncreasePowerDelayTime2_s(uint8_t unitId) { return requestAisweiRead(unitId, 45449); }
+bool speedOfUnderVoltageRecoverToPn(uint8_t unitId) { return requestAisweiRead(unitId, 45450); }
 
-void underVoltageIncreasePowerMode(uint8_t slave)                { requestAisweiRead(slave, 45443); }
-void underVoltageIncreasePowerStartVoltage_percentUn(uint8_t slave) { requestAisweiRead(slave, 45444); }
-void underVoltageIncreasePowerStopVoltage_percentUn(uint8_t slave)  { requestAisweiRead(slave, 45445); }
-void underVoltageIncreasePowerBackVoltage_percentUn(uint8_t slave)  { requestAisweiRead(slave, 45446); }
-void increaseRatioOfUnderVoltageIncreasePower(uint8_t slave)     { requestAisweiRead(slave, 45447); }
-void underVoltageIncreasePowerDelayTime_s(uint8_t slave)         { requestAisweiRead(slave, 45448); }
-void underVoltageIncreasePowerDelayTime2_s(uint8_t slave)        { requestAisweiRead(slave, 45449); }
-void speedOfUnderVoltageRecoverToPn(uint8_t slave)               { requestAisweiRead(slave, 45450); }
+bool pav_percentPn(uint8_t unitId) { return requestAisweiRead(unitId, 45451); }
+bool drmsPval_percentPn(uint8_t unitId) { return requestAisweiRead(unitId, 45452); }
 
-void pav_percentPn(uint8_t slave)                                { requestAisweiRead(slave, 45451); }
-void drmsPval_percentPn(uint8_t slave)                           { requestAisweiRead(slave, 45452); }
+bool reactivePowerControlMode(uint8_t unitId) { return requestAisweiRead(unitId, 45501); }
+bool timeConstantOfReactivePowerCurve_s(uint8_t unitId) { return requestAisweiRead(unitId, 45502); }
+bool pfSetValue(uint8_t unitId) { return requestAisweiRead(unitId, 45503); }
+bool cosPPowerCurve_point1_activePercentPn(uint8_t unitId) { return requestAisweiRead(unitId, 45504); }
+bool cosPPowerCurve_point1_cosPhi(uint8_t unitId) { return requestAisweiRead(unitId, 45505); }
+bool cosPPowerCurve_point2_activePercentPn(uint8_t unitId) { return requestAisweiRead(unitId, 45506); }
+bool cosPPowerCurve_point2_cosPhi(uint8_t unitId) { return requestAisweiRead(unitId, 45507); }
+bool cosPPowerCurve_point3_activePercentPn(uint8_t unitId) { return requestAisweiRead(unitId, 45508); }
+bool cosPPowerCurve_point3_cosPhi(uint8_t unitId) { return requestAisweiRead(unitId, 45509); }
+bool cosPPowerCurve_point4_activePercentPn(uint8_t unitId) { return requestAisweiRead(unitId, 45510); }
+bool cosPPowerCurve_point4_cosPhi(uint8_t unitId) { return requestAisweiRead(unitId, 45511); }
+bool lockInVoltageForCosPPowerCurve_percentUn(uint8_t unitId) { return requestAisweiRead(unitId, 45512); }
+bool lockOutVoltageForCosPPowerCurve_percentUn(uint8_t unitId) { return requestAisweiRead(unitId, 45513); }
+bool QSetValue_percentSn(uint8_t unitId) { return requestAisweiRead(unitId, 45516); }
+bool QU_curve_point1_U_percentUn(uint8_t unitId) { return requestAisweiRead(unitId, 45518); }
+bool QU_curve_point1_Q_percentSn(uint8_t unitId) { return requestAisweiRead(unitId, 45519); }
+bool QU_curve_point2_U_percentUn(uint8_t unitId) { return requestAisweiRead(unitId, 45520); }
+bool QU_curve_point2_Q_percentSn(uint8_t unitId) { return requestAisweiRead(unitId, 45521); }
+bool QU_curve_point3_U_percentUn(uint8_t unitId) { return requestAisweiRead(unitId, 45522); }
+bool QU_curve_point3_Q_percentSn(uint8_t unitId) { return requestAisweiRead(unitId, 45523); }
+bool QU_curve_point4_U_percentUn(uint8_t unitId) { return requestAisweiRead(unitId, 45524); }
+bool QU_curve_point4_Q_percentSn(uint8_t unitId) { return requestAisweiRead(unitId, 45525); }
+bool lockInPowerForQU_curve_percentPn(uint8_t unitId) { return requestAisweiRead(unitId, 45526); }
+bool lockOutPowerForQU_curve_percentPn(uint8_t unitId) { return requestAisweiRead(unitId, 45527); }
 
-void reactivePowerControlMode(uint8_t slave) { requestAisweiRead(slave, 45501); }
-void timeConstantOfReactivePowerCurve_s(uint8_t slave) { requestAisweiRead(slave, 45502); }
-void pfSetValue(uint8_t slave) { requestAisweiRead(slave, 45503); }
-void cosPPowerCurve_point1_activePercentPn(uint8_t slave) { requestAisweiRead(slave, 45504); }
-void cosPPowerCurve_point1_cosPhi(uint8_t slave) { requestAisweiRead(slave, 45505); }
-void cosPPowerCurve_point2_activePercentPn(uint8_t slave) { requestAisweiRead(slave, 45506); }
-void cosPPowerCurve_point2_cosPhi(uint8_t slave) { requestAisweiRead(slave, 45507); }
-void cosPPowerCurve_point3_activePercentPn(uint8_t slave) { requestAisweiRead(slave, 45508); }
-void cosPPowerCurve_point3_cosPhi(uint8_t slave) { requestAisweiRead(slave, 45509); }
-void cosPPowerCurve_point4_activePercentPn(uint8_t slave) { requestAisweiRead(slave, 45510); }
-void cosPPowerCurve_point4_cosPhi(uint8_t slave) { requestAisweiRead(slave, 45511); }
-void lockInVoltageForCosPPowerCurve_percentUn(uint8_t slave) { requestAisweiRead(slave, 45512); }
-void lockOutVoltageForCosPPowerCurve_percentUn(uint8_t slave) { requestAisweiRead(slave, 45513); }
-void QSetValue_percentSn(uint8_t slave) { requestAisweiRead(slave, 45516); }
-void QU_curve_point1_U_percentUn(uint8_t slave) { requestAisweiRead(slave, 45518); }
-void QU_curve_point1_Q_percentSn(uint8_t slave) { requestAisweiRead(slave, 45519); }
-void QU_curve_point2_U_percentUn(uint8_t slave) { requestAisweiRead(slave, 45520); }
-void QU_curve_point2_Q_percentSn(uint8_t slave) { requestAisweiRead(slave, 45521); }
-void QU_curve_point3_U_percentUn(uint8_t slave) { requestAisweiRead(slave, 45522); }
-void QU_curve_point3_Q_percentSn(uint8_t slave) { requestAisweiRead(slave, 45523); }
-void QU_curve_point4_U_percentUn(uint8_t slave) { requestAisweiRead(slave, 45524); }
-void QU_curve_point4_Q_percentSn(uint8_t slave) { requestAisweiRead(slave, 45525); }
-void lockInPowerForQU_curve_percentPn(uint8_t slave) { requestAisweiRead(slave, 45526); }
-void lockOutPowerForQU_curve_percentPn(uint8_t slave) { requestAisweiRead(slave, 45527); }
-
-void LVRT_TriggerVoltage_percentUn(uint8_t slave) { requestAisweiRead(slave, 45606); }
-void LVRT_activePowerLimitMode(uint8_t slave) { requestAisweiRead(slave, 45609); }
-
-/* --- generic write helpers --- */
-bool writeRegisterU16(uint8_t slave, uint32_t addr_dec, uint16_t value) {
-    uint16_t reg = aiswei_dec2reg(addr_dec);
-    // write single 16-bit holding register
-    // (assumes esp32ModbusRTU provides writeSingleRegister)
-    return modbus.writeSingleHoldingRegister(slave, reg, value);
-}
-
-bool writeRegisterU32(uint8_t slave, uint32_t addr_dec, uint32_t value) {
-    uint16_t reg = aiswei_dec2reg(addr_dec);
-    uint16_t vals[2];
-    vals[0] = static_cast<uint16_t>((value >> 16) & 0xFFFF); // high word first
-    vals[1] = static_cast<uint16_t>(value & 0xFFFF);
-    // write two registers
-    return modbus.writeMultHoldingRegisters(slave, reg, 2, (uint8_t *)vals);
-}
+bool LVRT_TriggerVoltage_percentUn(uint8_t unitId) { return requestAisweiRead(unitId, 45606); }
+bool LVRT_activePowerLimitMode(uint8_t unitId) { return requestAisweiRead(unitId, 45609); }
 
 /* --- write wrappers for each RW holding register --- */
-/* simple single-register writers */
-bool write_remoteSwitchCommand(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 40201, value); }
-bool write_rtc_Year(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41001, value); }
-bool write_rtc_Month(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41002, value); }
-bool write_rtc_Day(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41003, value); }
-bool write_rtc_Hour(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41004, value); }
-bool write_rtc_Minute(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41005, value); }
-bool write_rtc_Seconds(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41006, value); }
+bool write_remoteSwitchCommand(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 40201, value); }
+bool write_rtc_Year(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41001, value); }
+bool write_rtc_Month(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41002, value); }
+bool write_rtc_Day(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41003, value); }
+bool write_rtc_Hour(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41004, value); }
+bool write_rtc_Minute(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41005, value); }
+bool write_rtc_Seconds(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41006, value); }
 
-bool write_storageInverterSwitch(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41102, value); }
-bool write_typeSelectionOfEnergyStorageMachine(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41103, value); }
-bool write_runMode(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41104, value); }
-bool write_batteryManufacturer(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41105, value); }
-bool write_smartMeterStatus(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41108, value); }
-bool write_smartMeterAdjustmentFlag(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41109, value); }
-bool write_setTargetPowerValue_W(uint8_t slave, uint32_t value) { return writeRegisterU32(slave, 41110, value); }
-bool write_currentPowerValueOfSmartMeter_W(uint8_t slave, uint32_t value) { return writeRegisterU32(slave, 41112, value); }
-bool write_antiReverseCurrentFlag(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41114, value); }
-bool write_batteryWakeUp(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41115, value); }
-bool write_commboxAndCloudCommunicationStatus(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41151, value); }
-bool write_chargeDischargeFlagBit(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41152, value); }
-bool write_chargeAndDischargePowerCommand_W(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 41153, value); }
+bool write_storageInverterSwitch(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41102, value); }
+bool write_typeSelectionOfEnergyStorageMachine(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41103, value); }
+bool write_runMode(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41104, value); }
+bool write_batteryManufacturer(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41105, value); }
+bool write_smartMeterStatus(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41108, value); }
+bool write_smartMeterAdjustmentFlag(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41109, value); }
+bool write_setTargetPowerValue_W(uint8_t unitId, uint32_t value) { return requestAisweiWriteDWord(unitId, 41110, value); }
+bool write_currentPowerValueOfSmartMeter_W(uint8_t unitId, uint32_t value) { return requestAisweiWriteDWord(unitId, 41112, value); }
+bool write_antiReverseCurrentFlag(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41114, value); }
+bool write_batteryWakeUp(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41115, value); }
+bool write_commboxAndCloudCommunicationStatus(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41151, value); }
+bool write_chargeDischargeFlagBit(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41152, value); }
+bool write_chargeAndDischargePowerCommand_W(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 41153, value); }
 
-bool write_activePowerControlFunction(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 44001, value); }
-bool write_eegControlFunction(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 44002, value); }
-bool write_slopeLoadFunction(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 44003, value); }
-bool write_overvoltageReducePowerFunction(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 44004, value); }
-bool write_overfrequencyReducePowerFunction(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 44005, value); }
-bool write_reactivePowerControlFunction(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 44006, value); }
-bool write_LVRTFunction(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 44007, value); }
-bool write_tenMinutesAverageOvervoltageProtectFunction(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 44009, value); }
-bool write_islandingProtectFunction(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 44010, value); }
-bool write_peConnectionCheckFunction(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 44012, value); }
-bool write_overloadFunction(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 44017, value); }
-bool write_shadowMPPTFunction(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 44025, value); }
+bool write_activePowerControlFunction(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 44001, value); }
+bool write_eegControlFunction(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 44002, value); }
+bool write_slopeLoadFunction(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 44003, value); }
+bool write_overvoltageReducePowerFunction(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 44004, value); }
+bool write_overfrequencyReducePowerFunction(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 44005, value); }
+bool write_reactivePowerControlFunction(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 44006, value); }
+bool write_LVRTFunction(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 44007, value); }
+bool write_tenMinutesAverageOvervoltageProtectFunction(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 44009, value); }
+bool write_islandingProtectFunction(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 44010, value); }
+bool write_peConnectionCheckFunction(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 44012, value); }
+bool write_overloadFunction(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 44017, value); }
+bool write_shadowMPPTFunction(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 44025, value); }
 
-bool write_gridCode(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45201, value); }
-bool write_overvoltageProtectionValue3_V(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45202, value); }
-bool write_overvoltageProtectionValue2_V(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45203, value); }
-bool write_overvoltageProtectionValueFreq_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45204, value); }
-bool write_underfrequencyProtectionValue_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45205, value); }
-bool write_gridVoltageHighLimit3_V(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45206, value); }
-bool write_gridVoltageHighLimitTime3_ms(uint8_t slave, uint32_t value) { return writeRegisterU32(slave, 45207, value); }
-bool write_gridVoltageHighLimit2_V(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45209, value); }
-bool write_gridVoltageHighLimitTime2_ms(uint8_t slave, uint32_t value) { return writeRegisterU32(slave, 45210, value); }
-bool write_gridVoltageHighLimit1_V(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45212, value); }
-bool write_gridVoltageHighLimitTime1_ms(uint8_t slave, uint32_t value) { return writeRegisterU32(slave, 45213, value); }
-bool write_gridVoltageLowLimit3_V(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45215, value); }
-bool write_gridVoltageLowLimitTime3_ms(uint8_t slave, uint32_t value) { return writeRegisterU32(slave, 45216, value); }
-bool write_gridVoltageLowLimit2_V(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45218, value); }
-bool write_gridVoltageLowLimitTime2_ms(uint8_t slave, uint32_t value) { return writeRegisterU32(slave, 45219, value); }
-bool write_gridVoltageLowLimit1_V(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45221, value); }
-bool write_gridVoltageLowLimitTime1_ms(uint8_t slave, uint32_t value) { return writeRegisterU32(slave, 45222, value); }
-bool write_tenMinutesAverageOvervoltageThreshold_V(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45224, value); }
-bool write_tenMinutesAverageOvervoltageProtectTime_ms(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45225, value); }
-bool write_overvoltageRecoverValue_V(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45226, value); }
-bool write_undervoltageRecoverValue_V(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45227, value); }
-bool write_gridFrequencyHighLimit3_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45228, value); }
-bool write_gridFrequencyHighLimitTime3_ms(uint8_t slave, uint32_t value) { return writeRegisterU32(slave, 45229, value); }
-bool write_gridFrequencyHighLimit2_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45231, value); }
-bool write_gridFrequencyHighLimitTime2_ms(uint8_t slave, uint32_t value) { return writeRegisterU32(slave, 45232, value); }
-bool write_gridFrequencyHighLimit1_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45234, value); }
-bool write_gridFrequencyHighLimitTime1_ms(uint8_t slave, uint32_t value) { return writeRegisterU32(slave, 45235, value); }
-bool write_gridFrequencyLowLimit3_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45237, value); }
-bool write_gridFrequencyLowLimitTime3_ms(uint8_t slave, uint32_t value) { return writeRegisterU32(slave, 45238, value); }
-bool write_gridFrequencyLowLimit2_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45240, value); }
-bool write_gridFrequencyLowLimitTime2_ms(uint8_t slave, uint32_t value) { return writeRegisterU32(slave, 45241, value); }
-bool write_gridFrequencyLowLimit1_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45243, value); }
-bool write_gridFrequencyLowLimitTime1_ms(uint8_t slave, uint32_t value) { return writeRegisterU32(slave, 45244, value); }
-bool write_varyRateOfFrequencyProtectValue_HzPerS(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45246, value); }
-bool write_varyRateOfFrequencyProtectTime_ms(uint8_t slave, uint32_t value) { return writeRegisterU32(slave, 45247, value); }
-bool write_overfrequencyRecoverValue_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45249, value); }
-bool write_underfrequencyRecoverValue_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45250, value); }
-bool write_timeOfFirstConnectionToGrid_s(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45251, value); }
-bool write_timeOfReconnectionToGrid_s(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45252, value); }
-bool write_isoProtectThreshold_kOhm(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45253, value); }
-bool write_dciProtectThreshold_mA(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45254, value); }
-bool write_dciProtectTime_ms(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45255, value); }
+bool write_gridCode(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45201, value); }
+bool write_overvoltageProtectionValue3_V(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45202, value); }
+bool write_overvoltageProtectionValue2_V(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45203, value); }
+bool write_overvoltageProtectionValueFreq_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45204, value); }
+bool write_underfrequencyProtectionValue_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45205, value); }
+bool write_gridVoltageHighLimit3_V(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45206, value); }
+bool write_gridVoltageHighLimitTime3_ms(uint8_t unitId, uint32_t value) { return requestAisweiWriteDWord(unitId, 45207, value); }
+bool write_gridVoltageHighLimit2_V(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45209, value); }
+bool write_gridVoltageHighLimitTime2_ms(uint8_t unitId, uint32_t value) { return requestAisweiWriteDWord(unitId, 45210, value); }
+bool write_gridVoltageHighLimit1_V(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45212, value); }
+bool write_gridVoltageHighLimitTime1_ms(uint8_t unitId, uint32_t value) { return requestAisweiWriteDWord(unitId, 45213, value); }
+bool write_gridVoltageLowLimit3_V(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45215, value); }
+bool write_gridVoltageLowLimitTime3_ms(uint8_t unitId, uint32_t value) { return requestAisweiWriteDWord(unitId, 45216, value); }
+bool write_gridVoltageLowLimit2_V(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45218, value); }
+bool write_gridVoltageLowLimitTime2_ms(uint8_t unitId, uint32_t value) { return requestAisweiWriteDWord(unitId, 45219, value); }
+bool write_gridVoltageLowLimit1_V(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45221, value); }
+bool write_gridVoltageLowLimitTime1_ms(uint8_t unitId, uint32_t value) { return requestAisweiWriteDWord(unitId, 45222, value); }
+bool write_tenMinutesAverageOvervoltageThreshold_V(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45224, value); }
+bool write_tenMinutesAverageOvervoltageProtectTime_ms(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45225, value); }
+bool write_overvoltageRecoverValue_V(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45226, value); }
+bool write_undervoltageRecoverValue_V(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45227, value); }
+bool write_gridFrequencyHighLimit3_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45228, value); }
+bool write_gridFrequencyHighLimitTime3_ms(uint8_t unitId, uint32_t value) { return requestAisweiWriteDWord(unitId, 45229, value); }
+bool write_gridFrequencyHighLimit2_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45231, value); }
+bool write_gridFrequencyHighLimitTime2_ms(uint8_t unitId, uint32_t value) { return requestAisweiWriteDWord(unitId, 45232, value); }
+bool write_gridFrequencyHighLimit1_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45234, value); }
+bool write_gridFrequencyHighLimitTime1_ms(uint8_t unitId, uint32_t value) { return requestAisweiWriteDWord(unitId, 45235, value); }
+bool write_gridFrequencyLowLimit3_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45237, value); }
+bool write_gridFrequencyLowLimitTime3_ms(uint8_t unitId, uint32_t value) { return requestAisweiWriteDWord(unitId, 45238, value); }
+bool write_gridFrequencyLowLimit2_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45240, value); }
+bool write_gridFrequencyLowLimitTime2_ms(uint8_t unitId, uint32_t value) { return requestAisweiWriteDWord(unitId, 45241, value); }
+bool write_gridFrequencyLowLimit1_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45243, value); }
+bool write_gridFrequencyLowLimitTime1_ms(uint8_t unitId, uint32_t value) { return requestAisweiWriteDWord(unitId, 45244, value); }
+bool write_varyRateOfFrequencyProtectValue_HzPerS(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45246, value); }
+bool write_varyRateOfFrequencyProtectTime_ms(uint8_t unitId, uint32_t value) { return requestAisweiWriteDWord(unitId, 45247, value); }
+bool write_overfrequencyRecoverValue_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45249, value); }
+bool write_underfrequencyRecoverValue_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45250, value); }
+bool write_timeOfFirstConnectionToGrid_s(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45251, value); }
+bool write_timeOfReconnectionToGrid_s(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45252, value); }
+bool write_isoProtectThreshold_kOhm(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45253, value); }
+bool write_dciProtectThreshold_mA(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45254, value); }
+bool write_dciProtectTime_ms(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45255, value); }
 
-bool write_loadRateOfFirstConnectionToGrid(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45401, value); }
-bool write_loadRateOfReconnectionToGrid(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45402, value); }
-bool write_activePowerSet_percentPn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45403, value); }
-bool write_increaseRateOfActivePower_percentPnPerMin(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45404, value); }
-bool write_decreaseRateOfActivePower_percentPnPerMin(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45405, value); }
-bool write_overFrequencyReducePowerMode(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45408, value); }
-bool write_overFrequencyReducePowerStartFrequency_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45409, value); }
-bool write_overFrequencyReducePowerStopFrequency_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45410, value); }
-bool write_overFrequencyReducePowerBackFrequency_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45411, value); }
-bool write_reduceRatioOfOverFrequencyReducePower(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45412, value); }
-bool write_overFrequencyReducePowerReduceDelayTime_s(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45413, value); }
-bool write_overFrequencyReducePowerRecoverDelayTime_s(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45414, value); }
-bool write_speedOfOverFrequencyRecoverToPn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45416, value); }
-bool write_overFrequencyZeroPowerFrequencyPoint_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45417, value); }
+bool write_loadRateOfFirstConnectionToGrid(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45401, value); }
+bool write_loadRateOfReconnectionToGrid(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45402, value); }
+bool write_activePowerSet_percentPn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45403, value); }
+bool write_increaseRateOfActivePower_percentPnPerMin(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45404, value); }
+bool write_decreaseRateOfActivePower_percentPnPerMin(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45405, value); }
+bool write_overFrequencyReducePowerMode(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45408, value); }
+bool write_overFrequencyReducePowerStartFrequency_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45409, value); }
+bool write_overFrequencyReducePowerStopFrequency_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45410, value); }
+bool write_overFrequencyReducePowerBackFrequency_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45411, value); }
+bool write_reduceRatioOfOverFrequencyReducePower(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45412, value); }
+bool write_overFrequencyReducePowerReduceDelayTime_s(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45413, value); }
+bool write_overFrequencyReducePowerRecoverDelayTime_s(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45414, value); }
+bool write_speedOfOverFrequencyRecoverToPn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45416, value); }
+bool write_overFrequencyZeroPowerFrequencyPoint_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45417, value); }
 
-bool write_overVoltageReducePowerMode(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45419, value); }
-bool write_overVoltageReducePowerStartVoltage_percentUn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45420, value); }
-bool write_overVoltageReducePowerStopVoltage_percentUn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45422, value); }
-bool write_overVoltageReducePowerBackVoltage_percentUn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45424, value); }
-bool write_reduceRatioOfOverVoltageReducePower(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45426, value); }
-bool write_overVoltageReducePowerDelayTime_s(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45427, value); }
-bool write_overVoltageRecoverPowerDelayTime_s(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45428, value); }
-bool write_speedOfOverVoltageRecoverToPn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45429, value); }
+bool write_overVoltageReducePowerMode(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45419, value); }
+bool write_overVoltageReducePowerStartVoltage_percentUn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45420, value); }
+bool write_overVoltageReducePowerStopVoltage_percentUn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45422, value); }
+bool write_overVoltageReducePowerBackVoltage_percentUn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45424, value); }
+bool write_reduceRatioOfOverVoltageReducePower(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45426, value); }
+bool write_overVoltageReducePowerDelayTime_s(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45427, value); }
+bool write_overVoltageRecoverPowerDelayTime_s(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45428, value); }
+bool write_speedOfOverVoltageRecoverToPn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45429, value); }
 
-bool write_underFrequencyIncreasePowerMode(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45432, value); }
-bool write_underFrequencyIncreasePowerStartFrequency_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45433, value); }
-bool write_underFrequencyIncreasePowerStopFrequency_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45434, value); }
-bool write_underFrequencyIncreasePowerBackFrequency_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45435, value); }
-bool write_increaseRatioOfUnderFrequencyIncreasePower(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45436, value); }
-bool write_underFrequencyIncreasePowerDelayTime_s(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45437, value); }
-bool write_underFrequencyRecoverPowerDelayTime_s(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45438, value); }
-bool write_speedOfUnderFrequencyRecoverToPn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45440, value); }
-bool write_underFrequencyZeroPowerFrequencyPoint_Hz(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45441, value); }
+bool write_underFrequencyIncreasePowerMode(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45432, value); }
+bool write_underFrequencyIncreasePowerStartFrequency_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45433, value); }
+bool write_underFrequencyIncreasePowerStopFrequency_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45434, value); }
+bool write_underFrequencyIncreasePowerBackFrequency_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45435, value); }
+bool write_increaseRatioOfUnderFrequencyIncreasePower(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45436, value); }
+bool write_underFrequencyIncreasePowerDelayTime_s(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45437, value); }
+bool write_underFrequencyRecoverPowerDelayTime_s(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45438, value); }
+bool write_speedOfUnderFrequencyRecoverToPn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45440, value); }
+bool write_underFrequencyZeroPowerFrequencyPoint_Hz(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45441, value); }
 
-bool write_underVoltageIncreasePowerMode(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45443, value); }
-bool write_underVoltageIncreasePowerStartVoltage_percentUn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45444, value); }
-bool write_underVoltageIncreasePowerStopVoltage_percentUn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45445, value); }
-bool write_underVoltageIncreasePowerBackVoltage_percentUn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45446, value); }
-bool write_increaseRatioOfUnderVoltageIncreasePower(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45447, value); }
-bool write_underVoltageIncreasePowerDelayTime_s(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45448, value); }
-bool write_underVoltageIncreasePowerDelayTime2_s(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45449, value); }
-bool write_speedOfUnderVoltageRecoverToPn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45450, value); }
+bool write_underVoltageIncreasePowerMode(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45443, value); }
+bool write_underVoltageIncreasePowerStartVoltage_percentUn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45444, value); }
+bool write_underVoltageIncreasePowerStopVoltage_percentUn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45445, value); }
+bool write_underVoltageIncreasePowerBackVoltage_percentUn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45446, value); }
+bool write_increaseRatioOfUnderVoltageIncreasePower(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45447, value); }
+bool write_underVoltageIncreasePowerDelayTime_s(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45448, value); }
+bool write_underVoltageIncreasePowerDelayTime2_s(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45449, value); }
+bool write_speedOfUnderVoltageRecoverToPn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45450, value); }
 
-bool write_pav_percentPn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45451, value); }
-bool write_drmsPval_percentPn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45452, value); }
+bool write_pav_percentPn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45451, value); }
+bool write_drmsPval_percentPn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45452, value); }
 
-bool write_reactivePowerControlMode(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45501, value); }
-bool write_timeConstantOfReactivePowerCurve_s(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45502, value); }
-bool write_pfSetValue(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45503, value); }
-bool write_cosPPowerCurve_point1_activePercentPn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45504, value); }
-bool write_cosPPowerCurve_point1_cosPhi(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45505, value); }
-bool write_cosPPowerCurve_point2_activePercentPn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45506, value); }
-bool write_cosPPowerCurve_point2_cosPhi(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45507, value); }
-bool write_cosPPowerCurve_point3_activePercentPn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45508, value); }
-bool write_cosPPowerCurve_point3_cosPhi(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45509, value); }
-bool write_cosPPowerCurve_point4_activePercentPn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45510, value); }
-bool write_cosPPowerCurve_point4_cosPhi(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45511, value); }
-bool write_lockInVoltageForCosPPowerCurve_percentUn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45512, value); }
-bool write_lockOutVoltageForCosPPowerCurve_percentUn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45513, value); }
-bool write_QSetValue_percentSn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45516, value); }
-bool write_QU_curve_point1_U_percentUn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45518, value); }
-bool write_QU_curve_point1_Q_percentSn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45519, value); }
-bool write_QU_curve_point2_U_percentUn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45520, value); }
-bool write_QU_curve_point2_Q_percentSn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45521, value); }
-bool write_QU_curve_point3_U_percentUn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45522, value); }
-bool write_QU_curve_point3_Q_percentSn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45523, value); }
-bool write_QU_curve_point4_U_percentUn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45524, value); }
-bool write_QU_curve_point4_Q_percentSn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45525, value); }
-bool write_lockInPowerForQU_curve_percentPn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45526, value); }
-bool write_lockOutPowerForQU_curve_percentPn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45527, value); }
+bool write_reactivePowerControlMode(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45501, value); }
+bool write_timeConstantOfReactivePowerCurve_s(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45502, value); }
+bool write_pfSetValue(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45503, value); }
+bool write_cosPPowerCurve_point1_activePercentPn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45504, value); }
+bool write_cosPPowerCurve_point1_cosPhi(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45505, value); }
+bool write_cosPPowerCurve_point2_activePercentPn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45506, value); }
+bool write_cosPPowerCurve_point2_cosPhi(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45507, value); }
+bool write_cosPPowerCurve_point3_activePercentPn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45508, value); }
+bool write_cosPPowerCurve_point3_cosPhi(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45509, value); }
+bool write_cosPPowerCurve_point4_activePercentPn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45510, value); }
+bool write_cosPPowerCurve_point4_cosPhi(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45511, value); }
+bool write_lockInVoltageForCosPPowerCurve_percentUn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45512, value); }
+bool write_lockOutVoltageForCosPPowerCurve_percentUn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45513, value); }
+bool write_QSetValue_percentSn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45516, value); }
+bool write_QU_curve_point1_U_percentUn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45518, value); }
+bool write_QU_curve_point1_Q_percentSn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45519, value); }
+bool write_QU_curve_point2_U_percentUn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45520, value); }
+bool write_QU_curve_point2_Q_percentSn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45521, value); }
+bool write_QU_curve_point3_U_percentUn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45522, value); }
+bool write_QU_curve_point3_Q_percentSn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45523, value); }
+bool write_QU_curve_point4_U_percentUn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45524, value); }
+bool write_QU_curve_point4_Q_percentSn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45525, value); }
+bool write_lockInPowerForQU_curve_percentPn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45526, value); }
+bool write_lockOutPowerForQU_curve_percentPn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45527, value); }
 
-bool write_LVRT_TriggerVoltage_percentUn(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45606, value); }
-bool write_LVRT_activePowerLimitMode(uint8_t slave, uint16_t value) { return writeRegisterU16(slave, 45609, value); }
+bool write_LVRT_TriggerVoltage_percentUn(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45606, value); }
+bool write_LVRT_activePowerLimitMode(uint8_t unitId, uint16_t value) { return requestAisweiWriteWord(unitId, 45609, value); }
