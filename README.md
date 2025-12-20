@@ -43,6 +43,7 @@ The responses are then published on an mqtt broker and an Influx database.
 ## TODO
 
 * Find out what the registers mean
+* Use non generic names for registers where meaning is known
 Finally: 
 * implement intelligent logic to operate and monitor the pv inverter and wallbox automatically
 * combine with heat pump control
