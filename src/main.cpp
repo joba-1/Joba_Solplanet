@@ -333,7 +333,7 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
 
 void setup() {
     Serial.begin(115200);
-    Serial1.begin(9600, SERIAL_8N1, 17, 4, true);  // Modbus connection
+    Serial1.begin(9600, SERIAL_8N1, 16, 17, true);  // Modbus connection
 
     connectWiFiIfNeeded();
     ensureMqttConnected();
@@ -368,6 +368,6 @@ void loop() {
     if (millis() - lastMillis > 30000) {
         lastMillis = millis();
         Serial.print("sending Modbus request...\n");
-        modbus.readInputRegisters(0x01, 52, 2);  // read 2 registers starting at address 52 from slave 1
+        modbus.readInputRegisters(0x03, 1358, 6);  // read 2 registers starting at address 52 from slave 1
     }
 }
