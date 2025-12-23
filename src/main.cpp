@@ -231,7 +231,7 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
         while (si > 0 && slug[si-1] == '_') --si;
         if (si == 0) {
             // fallback to numeric address if slug empty
-            snprintf(slug, sizeof(slug), "%u", ri->addr);
+            snprintf(slug, sizeof(slug), "%lu", ri->addr);
         } else {
             slug[si] = '\0';
         }
@@ -595,11 +595,13 @@ void setup() {
     Serial1.begin(MODBUS_BAUDRATE, SERIAL_8N1, MODBUS_RX, MODBUS_TX);  // Modbus connection
 
     modbus.onData([](uint8_t serverAddress, esp32Modbus::FunctionCode fc, uint16_t address, uint8_t* data, size_t length) {
-        Serial.printf("id 0x%02x fc 0x%02x len %u: 0x", serverAddress, fc, length);
+        size_t pos = snprintf(msg, sizeof(msg), "id 0x%02x fc 0x%02x len %u: 0x", serverAddress, fc, length);
         for (size_t i = 0; i < length; ++i) {
-            Serial.printf("%02x", data[i]);
+            pos += snprintf(&msg[pos], sizeof(msg) - pos, "%02x", data[i]);
         }
-        Serial.printf("\n");
+        snprintf(&msg[pos], sizeof(msg) - pos, "\n");
+        slog(msg);
+        msg[0] = '\0';  // clear message after displaying it
 
         // decode according to AISWEI register metadata and publish readable payload
         decodeAndPublish(serverAddress, fc, address, data, length);
@@ -630,11 +632,12 @@ void loop() {
 
     handle_reboot();
 
-    if (millis() - lastMillis > 30000) {
+    if (millis() - lastMillis > 5000) {
         lastMillis = millis();
         snprintf(msg, sizeof(msg), "sending Modbus request...\n");
         slog(msg);
         msg[0] = '\0';  // clear message after displaying it
         modbus.readInputRegisters(0x03, 1358, 6);  // read 6 registers starting at address 1358 from device 3
+        // modbus.readInputRegisters(0x03, 1001, 1);  // read 1 register starting at address 1001 from device 3
     }
 }
