@@ -1,8 +1,76 @@
 #include <Arduino.h>
-#include <esp32ModbusRTU.h>
+
+#include <WiFiManager.h>
+
+// Web Updater
+#include <ESPAsyncWebServer.h>
 #include <WiFi.h>
+#include <WiFiClient.h>
+
+#define WEBSERVER_PORT 80
+AsyncWebServer webServer(WEBSERVER_PORT);
+uint32_t shouldReboot = 0;   // after updates or timeouts...
+uint32_t delayReboot = 100;  // reboot with a slight delay
+
+// MQTT
 #include <PubSubClient.h>
+
+#ifndef MQTT_SERVER
+#define MQTT_SERVER "job4"
+#endif
+#ifndef MQTT_PORT
+#define MQTT_PORT 1883
+#endif
+#ifndef MQTT_TOPIC
+#define MQTT_TOPIC "joba_solplanet"
+#endif
+
+static WiFiClient wifiMqtt;
+static PubSubClient mqttClient(wifiMqtt);
+static const char* mqttPrefix = MQTT_TOPIC;
+
+// Time sync
+#include <time.h>
+
+#ifndef NTP_SERVER
+#define NTP_SERVER "ax3"
+#endif
+
+char start_time[30];
+
+// Syslog
+#include <Syslog.h>
+
+#ifndef SYSLOG_SERVER
+#define SYSLOG_SERVER "job4"
+#endif
+#ifndef SYSLOG_PORT
+#define SYSLOG_PORT 514
+#endif
+
+WiFiUDP logUDP;
+Syslog syslog(logUDP, SYSLOG_PROTO_IETF);
+char msg[512];  // one buffer for all syslog and web messages
+
+void slog(const char *message, uint16_t pri = LOG_INFO) {
+    static bool log_infos = true;
+    
+    if (pri < LOG_INFO || log_infos) {
+        Serial.println(message);
+        syslog.log(pri, message);
+    }
+
+    if (log_infos && millis() > 10 * 60 * 1000) {
+        log_infos = false;  // log infos only for first 10 minutes
+        slog("Switch off info level messages", LOG_NOTICE);
+    }
+}
+
+// Modbus RTU
+#include <esp32ModbusRTU.h>
 #include "modbus_registers.h"
+
+esp32ModbusRTU modbus(&Serial1, -1);  // use Serial1 and no pin as RTS
 
 // translate AISWEI warning codes to descriptive strings
 const char* warnCodeToString(uint16_t code) {
@@ -108,56 +176,24 @@ const char* gridCodeToString(uint16_t code) {
     }
 }
 
-static WiFiClient espClient;
-static PubSubClient mqttClient(espClient);
-static const char* mqttPrefix = "joba_aiswei";
-
-#ifndef MQTT_SERVER
-#define MQTT_SERVER "job4"
-#endif
-#ifndef MQTT_PORT
-#define MQTT_PORT 1883
-#endif
-
-// helper: attempt WiFi connection only if credentials provided at build time
-static void connectWiFiIfNeeded() {
-#ifdef WIFI_SSID
-    if (WiFi.status() == WL_CONNECTED) return;
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    Serial.printf("Connecting to WiFi '%s' ", WIFI_SSID);
-    uint32_t start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
-        delay(500);
-        Serial.print(".");
-    }
-    Serial.println();
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
-    } else {
-        Serial.println("WiFi not connected (timed out)");
-    }
-#else
-    Serial.println("WIFI_SSID not defined at build time — assuming network already configured.");
-#endif
-}
-
 static void ensureMqttConnected() {
     if (mqttClient.connected()) return;
     mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
-    Serial.printf("Connecting to MQTT %s:%d ...\n", MQTT_SERVER, MQTT_PORT);
-    // client id: joba_aiswei + last 4 of chip id
+    snprintf(msg, sizeof(msg), "Connecting to MQTT %s:%d ...\n", MQTT_SERVER, MQTT_PORT);
+    slog(msg);
+    msg[0] = '\0';  // clear message after displaying it
+    // client id: joba_solplanet + last 4 of chip id
     uint32_t chipid = (uint32_t)ESP.getEfuseMac();
     char clientId[40];
     snprintf(clientId, sizeof(clientId), "%s-%08X", mqttPrefix, (unsigned int)(chipid & 0xFFFFFFFF));
     if (mqttClient.connect(clientId)) {
-        Serial.println("MQTT connected");
+        slog("MQTT connected");
     } else {
-        Serial.printf("MQTT connect failed, rc=%d\n", mqttClient.state());
+        snprintf(msg, sizeof(msg), "MQTT connect failed, rc=%d\n", mqttClient.state());
+        slog(msg);
+        msg[0] = '\0';  // clear message after displaying it
     }
 }
-
-// extern modbus object
-esp32ModbusRTU modbus(&Serial1, 16);  // use Serial1 and pin 16 as RTS
 
 // helper: decode a single Modbus response and publish a human friendly payload to MQTT
 static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc, uint16_t address, uint8_t* data, size_t length) {
@@ -199,10 +235,10 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
         } else {
             slug[si] = '\0';
         }
-        snprintf(topic, sizeof(topic), "%s/modbus/%u/%s", mqttPrefix, serverAddress, slug);
+        snprintf(topic, sizeof(topic), "%s/%u/%s", mqttPrefix, serverAddress, slug);
     } else {
         // fallback to numeric register offset (legacy)
-        snprintf(topic, sizeof(topic), "%s/modbus/%u/%u", mqttPrefix, serverAddress, address);
+        snprintf(topic, sizeof(topic), "%s/%u/%u", mqttPrefix, serverAddress, address);
     }
 
     char payload[128] = {0};
@@ -216,7 +252,9 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
             memcpy(&value, tmp, sizeof(value));
             snprintf(payload, sizeof(payload), "%.3f", value);
             if (mqttClient.connected()) mqttClient.publish(topic, payload);
-            Serial.printf("decoded float: %s\n\n", payload);
+            snprintf(msg, sizeof(msg), "decoded float: %s\n\n", payload);
+            slog(msg);
+            msg[0] = '\0';  // clear message after displaying it
             return;
         }
 
@@ -227,7 +265,9 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
         }
         payload[pos] = '\0';
         if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        Serial.printf("no register meta -> hex: %s\n\n", payload);
+        snprintf(msg, sizeof(msg), "no register meta -> hex: %s\n\n", payload);
+        slog(msg);
+        msg[0] = '\0';  // clear message after displaying it
         return;
     }
 
@@ -265,7 +305,9 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
         payload[pos] = '\0';
         if (payload[0] == '\0') strncpy(payload, "<empty>", sizeof(payload));
         if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        Serial.printf("%s -> %s\n\n", ri->name, payload);
+        snprintf(msg, sizeof(msg), "%s -> %s\n\n", ri->name, payload);
+        slog(msg);
+        msg[0] = '\0';  // clear message after displaying it
         return;
     }
 
@@ -298,7 +340,9 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
             }
         }
         if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        Serial.printf("%s -> %s\n\n", ri->name, payload);
+        snprintf(msg, sizeof(msg), "%s -> %s\n\n", ri->name, payload);
+        slog(msg);
+        msg[0] = '\0';  // clear message after displaying it
         return;
     }
 
@@ -315,7 +359,9 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
             }
         }
         if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        Serial.printf("%s -> %s\n\n", ri->name, payload);
+        snprintf(msg, sizeof(msg), "%s -> %s\n\n", ri->name, payload);
+        slog(msg);
+        msg[0] = '\0';  // clear message after displaying it
         return;
     }
 
@@ -327,16 +373,226 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
         }
         payload[pos] = '\0';
         if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        Serial.printf("%s -> %s (hex)\n\n", ri->name, payload);
+        snprintf(msg, sizeof(msg), "%s -> %s (hex)\n\n", ri->name, payload);
+        slog(msg);
+        msg[0] = '\0';  // clear message after displaying it
     }
 }
 
-void setup() {
-    Serial.begin(115200);
-    Serial1.begin(9600, SERIAL_8N1, 16, 17, true);  // Modbus connection
+// reconnect wlan if needed, return true if connected
+bool handle_wifi() {
+    static const uint32_t reconnectInterval = 10000;  // try reconnect every 10s
+    static const uint32_t reconnectLimit = 60;        // try restart after 10min
+    static uint32_t reconnectPrev = 0;
+    static uint32_t reconnectCount = 0;
 
-    connectWiFiIfNeeded();
+    bool currConnected = WiFi.isConnected();
+
+    if (currConnected) {
+        reconnectCount = 0;
+    }
+    else {
+        uint32_t now = millis();
+        if (reconnectCount == 0 || now - reconnectPrev > reconnectInterval) {
+            WiFi.reconnect();
+            reconnectCount++;
+            if (reconnectCount > reconnectLimit) {
+                Serial.println("Failed to reconnect WLAN, about to reset");
+                for (int i = 0; i < 20; i++) {
+                    digitalWrite(LED_PIN, (i & 1) ? LOW : HIGH);
+                    delay(100);
+                }
+                Serial1.end();
+                ESP.restart();
+                while (true)
+                    ;
+            }
+            reconnectPrev = now;
+        }
+    }
+
+    return currConnected;
+}
+
+// check ntp status, return true if time is valid
+bool check_ntptime() {
+    static bool have_time = false;
+
+    bool valid_time = time(0) > 1582230020;
+
+    if (!have_time && valid_time) {
+        have_time = true;
+        time_t now = time(NULL);
+        strftime(start_time, sizeof(start_time), "%F %T", localtime(&now));
+        snprintf(msg, sizeof(msg), "Got valid time at %s", start_time);
+        slog(msg, LOG_NOTICE);
+        msg[0] = '\0';  // clear message after displaying it
+    }
+
+    return have_time;
+}
+
+void handle_reboot() {
+    if (shouldReboot) {
+        uint32_t now = millis();
+        if (now - shouldReboot > delayReboot) {
+            Serial1.end();
+            ESP.restart();
+        }
+    }
+}
+
+// Standard web page
+const char *main_page(const char *msg = "", bool refresh = false) {
+    static const char fmt[] =
+        "<!doctype html>\n"
+        "<html lang=\"en\">\n"
+        " <head>\n"
+        "  <meta charset=\"utf-8\">\n"
+        "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        "  <link href=\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQAgMAAABinRfyAAAADFBMVEUqYbutnpTMuq/70SQgIef5AAAAVUlEQVQIHWOAAPkvDAyM3+Y7MLA7NV5g4GVqKGCQYWowYTBhapBhMGB04GE4/0X+M8Pxi+6XGS67XzzO8FH+iz/Dl/q/8gx/2S/UM/y/wP6f4T8QAAB3Bx3jhPJqfQAAAABJRU5ErkJggg==\" rel=\"icon\" type=\"image/x-icon\" />\n"
+        "  %s<title>" PROGNAME " v" VERSION "</title>\n"
+        " </head>\n"
+        " <body>\n"
+        "  <h1>" PROGNAME " v" VERSION "</h1>\n"
+        "  %s<p>update <a href=\"/update\">here</a>\n"
+        "  <p>reset <a href=\"/reset\">here</a>\n"
+        "  <p><small>Author: Joachim Banzhaf</small><a href=\"https://github.com/joba-1/Joba_Solplanet\" target=\"_blank\"><small> Github</small></a>\n"
+        " </body>\n"
+        "</html>\n";
+    static char page[sizeof(fmt) + 500] = "";
+    const char *meta = refresh ? "  <meta http-equiv=\"refresh\" content=\"7; url=/\"> \n" : "";
+    snprintf(page, sizeof(page), fmt, meta, msg);
+    return page;
+}
+
+void setup() {
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, HIGH);
+
+    Serial.begin(BAUDRATE);
+    Serial.println("\nStarting " PROGNAME " v" VERSION " " __DATE__ " " __TIME__);
+
+    String host(HOSTNAME);
+    host.toLowerCase();
+    WiFi.hostname(host.c_str());
+    WiFi.mode(WIFI_STA);
+
+    // Syslog setup
+    syslog.server(SYSLOG_SERVER, SYSLOG_PORT);
+    syslog.deviceHostname(WiFi.getHostname());
+    syslog.appName("Joba1");
+    syslog.defaultPriority(LOG_KERN);
+
+    digitalWrite(LED_PIN, LOW);
+
+    WiFiManager wm;
+    wm.setConfigPortalTimeout(180);
+    if (!wm.autoConnect(WiFi.getHostname(), WiFi.getHostname())) {
+        Serial.println("Failed to connect WLAN, about to reset");
+        for (int i = 0; i < 20; i++) {
+            digitalWrite(LED_PIN, (i & 1) ? HIGH : LOW);
+            delay(100);
+        }
+        Serial1.end();
+        ESP.restart();
+        while (true)
+            ;
+    }
+
+    snprintf(msg, sizeof(msg), "%s WLAN IP is %s", HOSTNAME, WiFi.localIP().toString().c_str());
+    slog(msg, LOG_NOTICE);
+
+    configTime(3600, 3600, NTP_SERVER);  // MEZ/MESZ
+
+    webServer.on("/", [](AsyncWebServerRequest *request) {
+        request->send(200, "text/html", main_page(msg));
+        msg[0] = '\0';  // clear message after displaying it
+    });
+
+    webServer.on("/wipe", HTTP_POST, [](AsyncWebServerRequest *request) {
+        WiFiManager wm;
+        wm.resetSettings();
+        static const char body[] = "  Wipe WLAN config. Connect to AP '" HOSTNAME "' and open http://192.168.4.1\n";
+        slog(body, LOG_NOTICE);
+        request->redirect("/");  
+        shouldReboot = millis();
+        if( shouldReboot == 0 ) {
+            shouldReboot--;
+        }
+    });
+
+    webServer.on("/reset", [](AsyncWebServerRequest *request) {
+        static const char body[] = "Reset now\n";
+        slog(body, LOG_NOTICE);
+        request->redirect("/");  
+        shouldReboot = millis();
+        if( shouldReboot == 0 ) {
+            shouldReboot--;
+        }
+    });
+
+    // Firmware Update Form
+    webServer.on("/update", HTTP_GET, [](AsyncWebServerRequest *request){
+        static const char body[] =
+            "  <form method=\"POST\" action=\"/update\" enctype=\"multipart/form-data\">\n"
+            "    <input type=\"file\" name=\"update\">\n"
+            "    <input type=\"submit\" value=\"Update\">\n"
+            "  </form>\n";
+ 
+        request->send(200, "text/html", main_page(body));
+    });
+
+    webServer.on("/update", HTTP_POST, [](AsyncWebServerRequest *request){
+        if( !Update.hasError() ) {
+            shouldReboot = millis();
+            if( shouldReboot == 0 ) {
+                shouldReboot--;
+            }
+            delayReboot = 5000;
+        }
+        AsyncWebServerResponse *response = request->beginResponse(200, "text/plain", shouldReboot ? "OK" : "FAIL");
+        response->addHeader("Connection", "close");
+        request->send(response);
+    },[](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final){
+        if(!index){
+            snprintf(msg, sizeof(msg), "Update Start: %s\n", filename.c_str());
+            slog(msg);
+            msg[0] = '\0';  // clear message after displaying it
+            if(!Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000)){
+                snprintf(msg, sizeof(msg), "%s", Update.errorString());
+                slog(msg);
+                request->redirect("/");  
+            }
+        }
+        if(!Update.hasError()){
+            if(Update.write(data, len) != len){
+                snprintf(msg, sizeof(msg), "%s", Update.errorString());
+                slog(msg);
+                request->redirect("/");  
+            }
+        }
+        if(final){
+            if(Update.end(true)){
+                snprintf(msg, sizeof(msg), "Update Success: %u Bytes", index+len);
+            } else {
+                snprintf(msg, sizeof(msg), "%s", Update.errorString());
+            }
+            slog(msg);
+            request->redirect("/"); 
+        }
+    });
+
+    // Catch all page
+    webServer.onNotFound( [](AsyncWebServerRequest *request) { 
+        request->send(404, "text/html", main_page("<h2>page not found</h2>\n")); 
+    });
+
+    webServer.begin();
+
     ensureMqttConnected();
+
+    Serial1.begin(MODBUS_BAUDRATE, SERIAL_8N1, MODBUS_RX, MODBUS_TX);  // Modbus connection
 
     modbus.onData([](uint8_t serverAddress, esp32Modbus::FunctionCode fc, uint16_t address, uint8_t* data, size_t length) {
         Serial.printf("id 0x%02x fc 0x%02x len %u: 0x", serverAddress, fc, length);
@@ -350,24 +606,35 @@ void setup() {
     });
 
     modbus.onError([](esp32Modbus::Error error) {
-        Serial.printf("error: 0x%02x\n\n", static_cast<uint8_t>(error));
+        snprintf(msg, sizeof(msg), "error: 0x%02x\n", static_cast<uint8_t>(error));
+        slog(msg);
     });
 
     modbus.begin();
+
+    digitalWrite(LED_PIN, HIGH);
 }
 
 void loop() {
     static uint32_t lastMillis = 0;
-    // maintain MQTT connection
-    if (!mqttClient.connected()) {
-        ensureMqttConnected();
-    } else {
-        mqttClient.loop();
+
+    if (handle_wifi()) {
+        check_ntptime();
+
+        if (!mqttClient.connected()) {
+            ensureMqttConnected();
+        } else {
+            mqttClient.loop();
+        }
     }
+
+    handle_reboot();
 
     if (millis() - lastMillis > 30000) {
         lastMillis = millis();
-        Serial.print("sending Modbus request...\n");
-        modbus.readInputRegisters(0x03, 1358, 6);  // read 2 registers starting at address 52 from slave 1
+        snprintf(msg, sizeof(msg), "sending Modbus request...\n");
+        slog(msg);
+        msg[0] = '\0';  // clear message after displaying it
+        modbus.readInputRegisters(0x03, 1358, 6);  // read 6 registers starting at address 1358 from device 3
     }
 }
