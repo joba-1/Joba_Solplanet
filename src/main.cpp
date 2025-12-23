@@ -67,10 +67,12 @@ void slog(const char *message, uint16_t pri = LOG_INFO) {
 }
 
 // Modbus RTU
+#include "modbus_sniffer.h"
+
 #include <esp32ModbusRTU.h>
 #include "modbus_registers.h"
 
-esp32ModbusRTU modbus(&Serial1, -1);  // use Serial1 and no pin as RTS
+// esp32ModbusRTU modbus(&Serial1, -1);  // use Serial1 and no pin as RTS
 
 // translate AISWEI warning codes to descriptive strings
 const char* warnCodeToString(uint16_t code) {
@@ -592,27 +594,29 @@ void setup() {
 
     ensureMqttConnected();
 
-    Serial1.begin(MODBUS_BAUDRATE, SERIAL_8N1, MODBUS_RX, MODBUS_TX);  // Modbus connection
+    // Serial1.begin(MODBUS_BAUDRATE, SERIAL_8N1, MODBUS_RX, MODBUS_TX);  // Modbus connection
 
-    modbus.onData([](uint8_t serverAddress, esp32Modbus::FunctionCode fc, uint16_t address, uint8_t* data, size_t length) {
-        size_t pos = snprintf(msg, sizeof(msg), "id 0x%02x fc 0x%02x len %u: 0x", serverAddress, fc, length);
-        for (size_t i = 0; i < length; ++i) {
-            pos += snprintf(&msg[pos], sizeof(msg) - pos, "%02x", data[i]);
-        }
-        snprintf(&msg[pos], sizeof(msg) - pos, "\n");
-        slog(msg);
-        msg[0] = '\0';  // clear message after displaying it
+    // modbus.onData([](uint8_t serverAddress, esp32Modbus::FunctionCode fc, uint16_t address, uint8_t* data, size_t length) {
+    //     size_t pos = snprintf(msg, sizeof(msg), "id 0x%02x fc 0x%02x len %u: 0x", serverAddress, fc, length);
+    //     for (size_t i = 0; i < length; ++i) {
+    //         pos += snprintf(&msg[pos], sizeof(msg) - pos, "%02x", data[i]);
+    //     }
+    //     snprintf(&msg[pos], sizeof(msg) - pos, "\n");
+    //     slog(msg);
+    //     msg[0] = '\0';  // clear message after displaying it
 
-        // decode according to AISWEI register metadata and publish readable payload
-        decodeAndPublish(serverAddress, fc, address, data, length);
-    });
+    //     // decode according to AISWEI register metadata and publish readable payload
+    //     decodeAndPublish(serverAddress, fc, address, data, length);
+    // });
 
-    modbus.onError([](esp32Modbus::Error error) {
-        snprintf(msg, sizeof(msg), "error: 0x%02x\n", static_cast<uint8_t>(error));
-        slog(msg);
-    });
+    // modbus.onError([](esp32Modbus::Error error) {
+    //     snprintf(msg, sizeof(msg), "error: 0x%02x\n", static_cast<uint8_t>(error));
+    //     slog(msg);
+    // });
 
-    modbus.begin();
+    // modbus.begin();
+
+    sniffer_init(MODBUS_TX, MODBUS_RX, MODBUS_BAUDRATE);
 
     digitalWrite(LED_PIN, HIGH);
 }
@@ -631,13 +635,16 @@ void loop() {
     }
 
     handle_reboot();
+    sniffer_loop();
 
     if (millis() - lastMillis > 5000) {
         lastMillis = millis();
-        snprintf(msg, sizeof(msg), "sending Modbus request...\n");
-        slog(msg);
-        msg[0] = '\0';  // clear message after displaying it
-        modbus.readInputRegisters(0x03, 1358, 6);  // read 6 registers starting at address 1358 from device 3
-        // modbus.readInputRegisters(0x03, 1001, 1);  // read 1 register starting at address 1001 from device 3
+        sniffer_print_frames();
+
+    //     snprintf(msg, sizeof(msg), "sending Modbus request...\n");
+    //     slog(msg);
+    //     msg[0] = '\0';  // clear message after displaying it
+    //     modbus.readInputRegisters(0x03, 1358, 6);  // read 6 registers starting at address 1358 from device 3
+    //     // modbus.readInputRegisters(0x03, 1001, 1);  // read 1 register starting at address 1001 from device 3
     }
 }
