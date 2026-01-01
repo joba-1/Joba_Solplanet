@@ -67,7 +67,7 @@ void slog(const char *message, uint16_t pri = LOG_INFO) {
 }
 
 // Modbus RTU
-#include "modbus_sniffer.h"
+// #include "modbus_sniffer.h"
 
 #include <esp32ModbusRTU.h>
 #include "modbus_registers.h"
@@ -192,7 +192,7 @@ static void ensureMqttConnected() {
         slog("MQTT connected");
     } else {
         snprintf(msg, sizeof(msg), "MQTT connect failed, rc=%d\n", mqttClient.state());
-        slog(msg);
+        slog(msg, LOG_ERR);
         msg[0] = '\0';  // clear message after displaying it
     }
 }
@@ -559,19 +559,19 @@ void setup() {
     },[](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final){
         if(!index){
             snprintf(msg, sizeof(msg), "Update Start: %s\n", filename.c_str());
-            slog(msg);
+            slog(msg, LOG_NOTICE);
             msg[0] = '\0';  // clear message after displaying it
             if(!Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000)){
                 snprintf(msg, sizeof(msg), "%s", Update.errorString());
-                slog(msg);
+                slog(msg, LOG_ERR);
                 request->redirect("/");  
             }
         }
         if(!Update.hasError()){
             if(Update.write(data, len) != len){
                 snprintf(msg, sizeof(msg), "%s", Update.errorString());
-                slog(msg);
-                request->redirect("/");  
+                slog(msg, LOG_ERR);
+                request->redirect("/"); 
             }
         }
         if(final){
@@ -580,7 +580,7 @@ void setup() {
             } else {
                 snprintf(msg, sizeof(msg), "%s", Update.errorString());
             }
-            slog(msg);
+            slog(msg, LOG_NOTICE);
             request->redirect("/"); 
         }
     });
@@ -594,7 +594,7 @@ void setup() {
 
     ensureMqttConnected();
 
-    // Serial1.begin(MODBUS_BAUDRATE, SERIAL_8N1, MODBUS_RX, MODBUS_TX);  // Modbus connection
+    Serial1.begin(MODBUS_BAUDRATE, SERIAL_8N1, MODBUS_RX, MODBUS_TX, false, 10);  // Modbus connection
 
     // modbus.onData([](uint8_t serverAddress, esp32Modbus::FunctionCode fc, uint16_t address, uint8_t* data, size_t length) {
     //     size_t pos = snprintf(msg, sizeof(msg), "id 0x%02x fc 0x%02x len %u: 0x", serverAddress, fc, length);
@@ -616,14 +616,45 @@ void setup() {
 
     // modbus.begin();
 
-    sniffer_init(MODBUS_TX, MODBUS_RX, MODBUS_BAUDRATE);
+    // sniffer_init(MODBUS_TX, MODBUS_RX, MODBUS_BAUDRATE);
+
+    slog("Setup done", LOG_NOTICE);
 
     digitalWrite(LED_PIN, HIGH);
 }
 
+void hex_out(const char* data, size_t length) {
+    size_t pos = snprintf(msg, sizeof(msg), "Modbus RX %2u bytes: 0x", (unsigned int)length);
+    for (size_t i = 0; i < length; ++i) {
+        pos += snprintf(&msg[pos], sizeof(msg) - pos, "%02x ", (unsigned char)data[i]);
+    }
+    snprintf(&msg[pos], sizeof(msg) - pos, "\n");
+    slog(msg);
+    msg[0] = '\0';  // clear message after displaying it
+}
+
+void handle_modbus() {
+    static char data[256];
+    static size_t pos = 0;
+    static uint32_t last = 0;
+
+    while (Serial1.available() && pos + 1 < sizeof(data)) {
+        int c = Serial1.read();
+        if (c < 0) break;
+        last = millis();
+        data[pos++] = (char)c;
+    }
+    
+    if (pos > 0 && millis() - last > 10) {
+        // assume end of frame after some silence
+        hex_out(data, pos);
+        pos = 0;
+    }
+}
+
 void loop() {
     static uint32_t lastMillis = 0;
-
+    
     if (handle_wifi()) {
         check_ntptime();
 
@@ -635,16 +666,20 @@ void loop() {
     }
 
     handle_reboot();
-    sniffer_loop();
+    handle_modbus();
+    // sniffer_loop();
 
     if (millis() - lastMillis > 5000) {
         lastMillis = millis();
-        sniffer_print_frames();
+        // sniffer_print_frames();
 
-    //     snprintf(msg, sizeof(msg), "sending Modbus request...\n");
-    //     slog(msg);
-    //     msg[0] = '\0';  // clear message after displaying it
-    //     modbus.readInputRegisters(0x03, 1358, 6);  // read 6 registers starting at address 1358 from device 3
-    //     // modbus.readInputRegisters(0x03, 1001, 1);  // read 1 register starting at address 1001 from device 3
+        slog("ping", LOG_NOTICE);
+
+        // snprintf(msg, sizeof(msg), "sending Modbus request...\n");
+        // slog(msg);
+        // msg[0] = '\0';  // clear message after displaying it
+        // modbus.readInputRegisters(0x03, 1358, 6);  // read 6 registers starting at address 1358 from device 3
+        
+        // modbus.readInputRegisters(0x03, 1001, 1);  // read 1 register starting at address 1001 from device 3
     }
 }
