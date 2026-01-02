@@ -594,8 +594,6 @@ void setup() {
 
     ensureMqttConnected();
 
-    Serial1.begin(MODBUS_BAUDRATE, SERIAL_8N1, MODBUS_RX, MODBUS_TX, false, 10);  // Modbus connection
-
     // modbus.onData([](uint8_t serverAddress, esp32Modbus::FunctionCode fc, uint16_t address, uint8_t* data, size_t length) {
     //     size_t pos = snprintf(msg, sizeof(msg), "id 0x%02x fc 0x%02x len %u: 0x", serverAddress, fc, length);
     //     for (size_t i = 0; i < length; ++i) {
@@ -616,9 +614,11 @@ void setup() {
 
     // modbus.begin();
 
-    // sniffer_init(MODBUS_TX, MODBUS_RX, MODBUS_BAUDRATE);
+    Serial1.begin(MODBUS_BAUDRATE, SERIAL_8N1, MODBUS_RX, MODBUS_TX, false, MODBUS_TIMEOUT);  // Modbus connection
 
-    slog("Setup done", LOG_NOTICE);
+    // sniffer_init(MODBUS_RX, MODBUS_TX, MODBUS_BAUDRATE);
+
+    slog(PROGNAME " " VERSION " setup done", LOG_NOTICE);
 
     digitalWrite(LED_PIN, HIGH);
 }
@@ -638,15 +638,14 @@ void handle_modbus() {
     static size_t pos = 0;
     static uint32_t last = 0;
 
-    while (Serial1.available() && pos + 1 < sizeof(data)) {
+    while (Serial1.available() && pos < sizeof(data)) {
         int c = Serial1.read();
         if (c < 0) break;
         last = millis();
         data[pos++] = (char)c;
     }
     
-    if (pos > 0 && millis() - last > 10) {
-        // assume end of frame after some silence
+    if (pos > 0 && millis() - last > MODBUS_TIMEOUT) {
         hex_out(data, pos);
         pos = 0;
     }
