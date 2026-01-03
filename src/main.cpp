@@ -68,6 +68,7 @@ void slog(const char *message, uint16_t pri = LOG_INFO) {
 
 // Modbus RTU
 // #include "modbus_sniffer.h"
+#include "ModbusRtuDecoder.h"
 
 #include <esp32ModbusRTU.h>
 #include "modbus_registers.h"
@@ -101,6 +102,7 @@ const char* warnCodeToString(uint16_t code) {
 // translate AISWEI error codes to descriptive strings
 const char* errorCodeToString(uint16_t code) {
     switch (code) {
+        case 0:  return "No error";
         case 1:  return "Communication fails between M-S";
         case 3:  return "Relay check fail";
         case 4:  return "DC injection high";
@@ -267,7 +269,7 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
         }
         payload[pos] = '\0';
         if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        snprintf(msg, sizeof(msg), "no register meta -> hex: %s\n\n", payload);
+        snprintf(msg, sizeof(msg), "no register meta -> hex: %s\n", payload);
         slog(msg);
         msg[0] = '\0';  // clear message after displaying it
         return;
@@ -307,7 +309,7 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
         payload[pos] = '\0';
         if (payload[0] == '\0') strncpy(payload, "<empty>", sizeof(payload));
         if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        snprintf(msg, sizeof(msg), "%s -> %s\n\n", ri->name, payload);
+        snprintf(msg, sizeof(msg), "%s -> %s\n", ri->name, payload);
         slog(msg);
         msg[0] = '\0';  // clear message after displaying it
         return;
@@ -342,7 +344,7 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
             }
         }
         if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        snprintf(msg, sizeof(msg), "%s -> %s\n\n", ri->name, payload);
+        snprintf(msg, sizeof(msg), "%s -> %s\n", ri->name, payload);
         slog(msg);
         msg[0] = '\0';  // clear message after displaying it
         return;
@@ -361,7 +363,7 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
             }
         }
         if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        snprintf(msg, sizeof(msg), "%s -> %s\n\n", ri->name, payload);
+        snprintf(msg, sizeof(msg), "%s -> %s\n", ri->name, payload);
         slog(msg);
         msg[0] = '\0';  // clear message after displaying it
         return;
@@ -375,7 +377,7 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
         }
         payload[pos] = '\0';
         if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        snprintf(msg, sizeof(msg), "%s -> %s (hex)\n\n", ri->name, payload);
+        snprintf(msg, sizeof(msg), "%s -> %s (hex)\n", ri->name, payload);
         slog(msg);
         msg[0] = '\0';  // clear message after displaying it
     }
@@ -623,8 +625,8 @@ void setup() {
     digitalWrite(LED_PIN, HIGH);
 }
 
-void hex_out(const char* data, size_t length) {
-    size_t pos = snprintf(msg, sizeof(msg), "Modbus RX %2u bytes: 0x", (unsigned int)length);
+void hex_out(const uint8_t* data, size_t length) {
+    size_t pos = snprintf(msg, sizeof(msg), "Modbus RX[%3u]: ", (unsigned int)length);
     for (size_t i = 0; i < length; ++i) {
         pos += snprintf(&msg[pos], sizeof(msg) - pos, "%02x ", (unsigned char)data[i]);
     }
@@ -634,20 +636,64 @@ void hex_out(const char* data, size_t length) {
 }
 
 void handle_modbus() {
-    static char data[256];
+    static uint8_t data[256];
     static size_t pos = 0;
     static uint32_t last = 0;
+
+    uint32_t now = millis();
 
     while (Serial1.available() && pos < sizeof(data)) {
         int c = Serial1.read();
         if (c < 0) break;
-        last = millis();
-        data[pos++] = (char)c;
+        now = millis();
+        last = now;
+        data[pos++] = (uint8_t)c;
     }
     
-    if (pos > 0 && millis() - last > MODBUS_TIMEOUT) {
-        hex_out(data, pos);
-        pos = 0;
+    if (pos > 0) {
+        uint32_t timeout = (pos <= 8) ? 300 : MODBUS_TIMEOUT;
+        if (now - last >= timeout) {
+            ModbusRtuDecoder::FramePair pair = {};
+            ModbusRtuDecoder decoder;
+            bool decoded = decoder.split_request_response(data, pos, pair);
+            if (decoded) {
+                decoder.frame_pair_to_string(pair, msg, sizeof(msg));
+                slog(msg);
+                msg[0] = '\0';  // clear message after displaying it
+                if (!pair.has_request || !pair.has_response || pair.request.quantity == 0 || (pair.response.byte_count & 1)) {
+                    decoded = false;
+                } else {
+                    // decode according to AISWEI register metadata and publish readable payload
+                    auto & resp = pair.response; 
+                    auto & req = pair.request; 
+                    esp32Modbus::FunctionCode fc = (esp32Modbus::FunctionCode)req.function_code;
+                    uint16_t addr = req.start_address;
+                    for (uint16_t i = 0; i < resp.byte_count; i += 2) {
+                        uint16_t regOff = addr + (i / 2);
+                        size_t regLen = 0;
+                        // find matching register definition by comparing register offsets
+                        for (size_t j = 0; j < aiswei_registers_count; ++j) {
+                            const RegisterInfo &r = aiswei_registers[j];
+                            uint16_t rOff = aiswei_dec2reg(r.addr);
+                            if (regOff == rOff) {
+                                regLen = r.length * 2;  // length in bytes
+                                break;
+                            }
+                        }
+                        if (regLen == 0 || i + regLen > resp.byte_count) {
+                            // not enough data left
+                            break;
+                        }
+                        decodeAndPublish(req.slave_id, fc, regOff, &resp.data[i], regLen);
+                    }
+                }
+            }
+            if (!decoded) {
+                hex_out(data, pos);
+            }
+
+            pos = 0;
+        }
     }
 }
 

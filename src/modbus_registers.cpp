@@ -281,7 +281,6 @@ int aiswei_find_register_index(uint32_t addr_dec) {
 // strip leading '3' or '4' (equivalent to addr % 10000), then subtract 1.
 uint16_t aiswei_dec2reg(uint32_t addr_dec) {
     uint32_t v = addr_dec % 10000;
-    if (v == 0) v = 0;
     return static_cast<uint16_t>((v == 0) ? 0 : (v - 1));
 }
 
