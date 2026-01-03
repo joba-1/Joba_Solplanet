@@ -670,7 +670,7 @@ void handle_modbus() {
                     uint16_t addr = req.start_address;
                     for (uint16_t i = 0; i < resp.byte_count; i += 2) {
                         uint16_t regOff = addr + (i / 2);
-                        size_t regLen = 0;
+                        size_t regLen = 2;
                         // find matching register definition by comparing register offsets
                         for (size_t j = 0; j < aiswei_registers_count; ++j) {
                             const RegisterInfo &r = aiswei_registers[j];
@@ -680,11 +680,12 @@ void handle_modbus() {
                                 break;
                             }
                         }
-                        if (regLen == 0 || i + regLen > resp.byte_count) {
+                        if (i + regLen > resp.byte_count) {
                             // not enough data left
                             break;
                         }
                         decodeAndPublish(req.slave_id, fc, regOff, &resp.data[i], regLen);
+                        i += regLen - 2;  // adjust for next register
                     }
                 }
             }
