@@ -11,6 +11,7 @@
 AsyncWebServer webServer(WEBSERVER_PORT);
 uint32_t shouldReboot = 0;   // after updates or timeouts...
 uint32_t delayReboot = 100;  // reboot with a slight delay
+char msg[512];
 
 // MQTT
 #include <PubSubClient.h>
@@ -28,6 +29,14 @@ uint32_t delayReboot = 100;  // reboot with a slight delay
 static WiFiClient wifiMqtt;
 static PubSubClient mqttClient(wifiMqtt);
 static const char* mqttPrefix = MQTT_TOPIC;
+
+// Post to InfluxDB
+// Influx DB can be created with command influx -execute "create database joba_solplanet"
+#include <HTTPClient.h>
+
+WiFiClient client;
+HTTPClient http;
+int influx_status = 0;
 
 // Time sync
 #include <time.h>
@@ -50,7 +59,7 @@ char start_time[30];
 
 WiFiUDP logUDP;
 Syslog syslog(logUDP, SYSLOG_PROTO_IETF);
-char msg[512];  // one buffer for all syslog and web messages
+char logmsg[512];
 
 void slog(const char *message, uint16_t pri = LOG_INFO) {
     static bool log_infos = true;
@@ -64,6 +73,48 @@ void slog(const char *message, uint16_t pri = LOG_INFO) {
         log_infos = false;  // log infos only for first 10 minutes
         slog("Switch off info level messages", LOG_NOTICE);
     }
+}
+
+// Post data to InfluxDB
+bool postInflux(const char *line) {
+    static const char uri[] = "/write?db=" INFLUX_DB "&precision=s";
+
+    http.begin(client, INFLUX_SERVER, INFLUX_PORT, uri);
+    http.setUserAgent(PROGNAME);
+    influx_status = http.POST(line);
+    String payload;
+    if (http.getSize() > 0) { // workaround for bug in getString()
+        payload = http.getString();
+    }
+    http.end();
+
+    if (influx_status < 200 || influx_status >= 300) {
+        snprintf(msg, sizeof(msg), "Post %s:%d%s status=%d line='%s' response='%s'",
+            INFLUX_SERVER, INFLUX_PORT, uri, influx_status, line, payload.c_str());
+        slog(msg, LOG_ERR);
+        return false;
+    }
+
+    return true;
+}
+
+bool sendInfluxData(uint8_t unit, uint8_t function_code, uint16_t reg, const char *name, const char *value, bool quoting = false) { 
+    static const char lineFmt[] = "modbus,unit=%u,fc=%u,register=%u%s %s";
+
+    char field[256];
+    if (quoting) {
+        snprintf(field, sizeof(field), "text=\"%s\"", value);
+    }
+    else {
+        snprintf(field, sizeof(field), "value=%s", value);
+    }
+    if (name == nullptr || name[0] == '\0') {
+        name = "-";
+    }
+    char nametag[128] = "";
+    snprintf(nametag, sizeof(nametag), ",name=%s", name);
+    snprintf(logmsg, sizeof(logmsg), lineFmt, unit, function_code, reg, nametag, field);
+    return postInflux(logmsg);
 }
 
 // Modbus RTU
@@ -183,9 +234,8 @@ const char* gridCodeToString(uint16_t code) {
 static void ensureMqttConnected() {
     if (mqttClient.connected()) return;
     mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
-    snprintf(msg, sizeof(msg), "Connecting to MQTT %s:%d ...\n", MQTT_SERVER, MQTT_PORT);
-    slog(msg);
-    msg[0] = '\0';  // clear message after displaying it
+    snprintf(logmsg, sizeof(logmsg), "Connecting to MQTT %s:%d ...\n", MQTT_SERVER, MQTT_PORT);
+    slog(logmsg);
     // client id: joba_solplanet + last 4 of chip id
     uint32_t chipid = (uint32_t)ESP.getEfuseMac();
     char clientId[40];
@@ -195,18 +245,17 @@ static void ensureMqttConnected() {
     } else {
         snprintf(msg, sizeof(msg), "MQTT connect failed, rc=%d\n", mqttClient.state());
         slog(msg, LOG_ERR);
-        msg[0] = '\0';  // clear message after displaying it
     }
 }
 
 // helper: decode a single Modbus response and publish a human friendly payload to MQTT
-static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc, uint16_t address, uint8_t* data, size_t length) {
+static void decodeAndPublish(uint8_t unit, esp32Modbus::FunctionCode fc, uint16_t reg, uint8_t* data, size_t length) {
     // find matching register definition by comparing register offsets
     const RegisterInfo* ri = nullptr;
     for (size_t i = 0; i < aiswei_registers_count; ++i) {
         const RegisterInfo &r = aiswei_registers[i];
         uint16_t regOff = aiswei_dec2reg(r.addr);
-        if (address >= regOff && address < regOff + r.length) {
+        if (reg >= regOff && reg < regOff + r.length) {
             ri = &r;
             break;
         }
@@ -214,9 +263,10 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
 
     // build topic using human readable slug derived from register name when available
     char topic[128];
+    char slug[64] = {0};
+
     if (ri && ri->name && ri->name[0]) {
         const char* name = ri->name;
-        char slug[64];
         size_t si = 0;
         bool lastUnderscore = false;
         for (size_t i = 0; name[i] && si + 1 < sizeof(slug); ++i) {
@@ -239,10 +289,10 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
         } else {
             slug[si] = '\0';
         }
-        snprintf(topic, sizeof(topic), "%s/%u/%s", mqttPrefix, serverAddress, slug);
+        snprintf(topic, sizeof(topic), "%s/%u/%s", mqttPrefix, unit, slug);
     } else {
         // fallback to numeric register offset (legacy)
-        snprintf(topic, sizeof(topic), "%s/%u/%u", mqttPrefix, serverAddress, address);
+        snprintf(topic, sizeof(topic), "%s/%u/%u", mqttPrefix, unit, reg);
     }
 
     char payload[128] = {0};
@@ -256,22 +306,22 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
             memcpy(&value, tmp, sizeof(value));
             snprintf(payload, sizeof(payload), "%.3f", value);
             if (mqttClient.connected()) mqttClient.publish(topic, payload);
-            snprintf(msg, sizeof(msg), "decoded float: %s\n\n", payload);
-            slog(msg);
-            msg[0] = '\0';  // clear message after displaying it
+            sendInfluxData(unit, fc, reg, slug, payload);
+            snprintf(logmsg, sizeof(logmsg), "decoded float: %s\n\n", payload);
+            slog(logmsg);
             return;
         }
 
-        // publish hex payload if unknown
-        size_t pos = 0;
-        for (size_t i = 0; i < length && pos + 3 < sizeof(payload); ++i) {
-            pos += snprintf(payload + pos, sizeof(payload) - pos, "%02x", data[i]);
+        // publish unknown registers as number
+        uint32_t num = 0;
+        for (size_t i = 0; i < length; ++i) {
+            num = (num << 8) | data[i];
         }
-        payload[pos] = '\0';
+        snprintf(payload, sizeof(payload), "%u", num);
         if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        snprintf(msg, sizeof(msg), "no register meta -> hex: %s\n", payload);
-        slog(msg);
-        msg[0] = '\0';  // clear message after displaying it
+        sendInfluxData(unit, fc, reg, slug, payload);
+        snprintf(logmsg, sizeof(logmsg), "no register meta -> value: %s\n", payload);
+        slog(logmsg);
         return;
     }
 
@@ -307,17 +357,18 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
             if (lo >= 32 && lo <= 126 && pos + 1 < sizeof(payload)) payload[pos++] = lo;
         }
         payload[pos] = '\0';
-        if (payload[0] == '\0') strncpy(payload, "<empty>", sizeof(payload));
+        // if (payload[0] == '\0') strncpy(payload, "<empty>", sizeof(payload));
         if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        snprintf(msg, sizeof(msg), "%s -> %s\n", ri->name, payload);
-        slog(msg);
-        msg[0] = '\0';  // clear message after displaying it
+        sendInfluxData(unit, fc, reg, slug, payload, true);
+        snprintf(logmsg, sizeof(logmsg), "%s -> %s\n", ri->name, payload);
+        slog(logmsg);
         return;
     }
 
     if (strcmp(type, "U16") == 0 || strcmp(type, "E16") == 0 || strcmp(type, "B16") == 0 || strcmp(type, "S16") == 0) {
+        bool quote = false;
         if (length < 2) {
-            snprintf(payload, sizeof(payload), "<too short>");
+            quote = true;
         } else {
             uint16_t raw = (uint16_t)data[0] << 8 | data[1];
             if (strcmp(type, "U16") == 0) {
@@ -330,12 +381,15 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
                 if (strstr(ri->name, "Warning") || strstr(ri->name, "warning")) {
                     const char* s = warnCodeToString(raw);
                     snprintf(payload, sizeof(payload), "%u (%s)", raw, s);
+                    quote = true;
                 } else if (strstr(ri->name, "Error") || strstr(ri->name, "error")) {
                     const char* s = errorCodeToString(raw);
                     snprintf(payload, sizeof(payload), "%u (%s)", raw, s);
+                    quote = true;
                 } else if (strstr(ri->name, "Grid") || strstr(ri->name, "grid")) {
                     const char* s = gridCodeToString(raw);
                     snprintf(payload, sizeof(payload), "%u (%s)", raw, s);
+                    quote = true;
                 } else {
                     snprintf(payload, sizeof(payload), "%u", raw);
                 }
@@ -344,16 +398,14 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
             }
         }
         if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        snprintf(msg, sizeof(msg), "%s -> %s\n", ri->name, payload);
-        slog(msg);
-        msg[0] = '\0';  // clear message after displaying it
+        sendInfluxData(unit, fc, reg, slug, payload, quote);
+        snprintf(logmsg, sizeof(logmsg), "%s -> %s\n", ri->name, payload);
+        slog(logmsg);
         return;
     }
 
     if (strcmp(type, "U32") == 0 || strcmp(type, "S32") == 0) {
-        if (length < 4) {
-            snprintf(payload, sizeof(payload), "<too short>");
-        } else {
+        if (length >= 4) {
             uint32_t raw = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | (uint32_t)data[3];
             if (strcmp(type, "S32") == 0) {
                 int32_t s = (int32_t)raw;
@@ -363,9 +415,9 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
             }
         }
         if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        snprintf(msg, sizeof(msg), "%s -> %s\n", ri->name, payload);
-        slog(msg);
-        msg[0] = '\0';  // clear message after displaying it
+        sendInfluxData(unit, fc, reg, slug, payload);
+        snprintf(logmsg, sizeof(logmsg), "%s -> %s\n", ri->name, payload);
+        slog(logmsg);
         return;
     }
 
@@ -377,9 +429,9 @@ static void decodeAndPublish(uint8_t serverAddress, esp32Modbus::FunctionCode fc
         }
         payload[pos] = '\0';
         if (mqttClient.connected()) mqttClient.publish(topic, payload);
-        snprintf(msg, sizeof(msg), "%s -> %s (hex)\n", ri->name, payload);
-        slog(msg);
-        msg[0] = '\0';  // clear message after displaying it
+        sendInfluxData(unit, fc, reg, slug, payload, true);
+        snprintf(logmsg, sizeof(logmsg), "%s -> %s (hex)\n", ri->name, payload);
+        slog(logmsg);
     }
 }
 
@@ -428,9 +480,8 @@ bool check_ntptime() {
         have_time = true;
         time_t now = time(NULL);
         strftime(start_time, sizeof(start_time), "%F %T", localtime(&now));
-        snprintf(msg, sizeof(msg), "Got valid time at %s", start_time);
-        slog(msg, LOG_NOTICE);
-        msg[0] = '\0';  // clear message after displaying it
+        snprintf(logmsg, sizeof(logmsg), "Got valid time at %s", start_time);
+        slog(logmsg, LOG_NOTICE);
     }
 
     return have_time;
@@ -447,7 +498,7 @@ void handle_reboot() {
 }
 
 // Standard web page
-const char *main_page(const char *msg = "", bool refresh = false) {
+const char *main_page(const char *webmsg = "", bool refresh = false) {
     static const char fmt[] =
         "<!doctype html>\n"
         "<html lang=\"en\">\n"
@@ -466,7 +517,7 @@ const char *main_page(const char *msg = "", bool refresh = false) {
         "</html>\n";
     static char page[sizeof(fmt) + 500] = "";
     const char *meta = refresh ? "  <meta http-equiv=\"refresh\" content=\"7; url=/\"> \n" : "";
-    snprintf(page, sizeof(page), fmt, meta, msg);
+    snprintf(page, sizeof(page), fmt, meta, webmsg);
     return page;
 }
 
@@ -504,8 +555,8 @@ void setup() {
             ;
     }
 
-    snprintf(msg, sizeof(msg), "%s WLAN IP is %s", HOSTNAME, WiFi.localIP().toString().c_str());
-    slog(msg, LOG_NOTICE);
+    snprintf(logmsg, sizeof(logmsg), "%s WLAN IP is %s", HOSTNAME, WiFi.localIP().toString().c_str());
+    slog(logmsg, LOG_NOTICE);
 
     configTime(3600, 3600, NTP_SERVER);  // MEZ/MESZ
 
@@ -562,7 +613,6 @@ void setup() {
         if(!index){
             snprintf(msg, sizeof(msg), "Update Start: %s\n", filename.c_str());
             slog(msg, LOG_NOTICE);
-            msg[0] = '\0';  // clear message after displaying it
             if(!Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000)){
                 snprintf(msg, sizeof(msg), "%s", Update.errorString());
                 slog(msg, LOG_ERR);
@@ -597,21 +647,20 @@ void setup() {
     ensureMqttConnected();
 
     // modbus.onData([](uint8_t serverAddress, esp32Modbus::FunctionCode fc, uint16_t address, uint8_t* data, size_t length) {
-    //     size_t pos = snprintf(msg, sizeof(msg), "id 0x%02x fc 0x%02x len %u: 0x", serverAddress, fc, length);
+    //     size_t pos = snprintf(logmsg, sizeof(logmsg), "id 0x%02x fc 0x%02x len %u: 0x", serverAddress, fc, length);
     //     for (size_t i = 0; i < length; ++i) {
-    //         pos += snprintf(&msg[pos], sizeof(msg) - pos, "%02x", data[i]);
+    //         pos += snprintf(&logmsg[pos], sizeof(logmsg) - pos, "%02x", data[i]);
     //     }
-    //     snprintf(&msg[pos], sizeof(msg) - pos, "\n");
-    //     slog(msg);
-    //     msg[0] = '\0';  // clear message after displaying it
+    //     snprintf(&logmsg[pos], sizeof(logmsg) - pos, "\n");
+    //     slog(logmsg);
 
     //     // decode according to AISWEI register metadata and publish readable payload
     //     decodeAndPublish(serverAddress, fc, address, data, length);
     // });
 
     // modbus.onError([](esp32Modbus::Error error) {
-    //     snprintf(msg, sizeof(msg), "error: 0x%02x\n", static_cast<uint8_t>(error));
-    //     slog(msg);
+    //     snprintf(logmsg, sizeof(logmsg), "error: 0x%02x\n", static_cast<uint8_t>(error));
+    //     slog(logmsg);
     // });
 
     // modbus.begin();
@@ -626,13 +675,12 @@ void setup() {
 }
 
 void hex_out(const uint8_t* data, size_t length) {
-    size_t pos = snprintf(msg, sizeof(msg), "Modbus RX[%3u]: ", (unsigned int)length);
+    size_t pos = snprintf(logmsg, sizeof(logmsg), "Modbus RX[%3u]: ", (unsigned int)length);
     for (size_t i = 0; i < length; ++i) {
-        pos += snprintf(&msg[pos], sizeof(msg) - pos, "%02x ", (unsigned char)data[i]);
+        pos += snprintf(&logmsg[pos], sizeof(logmsg) - pos, "%02x ", (unsigned char)data[i]);
     }
-    snprintf(&msg[pos], sizeof(msg) - pos, "\n");
-    slog(msg);
-    msg[0] = '\0';  // clear message after displaying it
+    snprintf(&logmsg[pos], sizeof(logmsg) - pos, "\n");
+    slog(logmsg);
 }
 
 void handle_modbus() {
@@ -657,9 +705,8 @@ void handle_modbus() {
             ModbusRtuDecoder decoder;
             bool decoded = decoder.split_request_response(data, pos, pair);
             if (decoded) {
-                decoder.frame_pair_to_string(pair, msg, sizeof(msg));
-                slog(msg);
-                msg[0] = '\0';  // clear message after displaying it
+                decoder.frame_pair_to_string(pair, logmsg, sizeof(logmsg));
+                slog(logmsg);
                 if (!pair.has_request || !pair.has_response || pair.request.quantity == 0 || (pair.response.byte_count & 1)) {
                     decoded = false;
                 } else {
@@ -721,9 +768,8 @@ void loop() {
 
         slog("ping", LOG_NOTICE);
 
-        // snprintf(msg, sizeof(msg), "sending Modbus request...\n");
-        // slog(msg);
-        // msg[0] = '\0';  // clear message after displaying it
+        // snprintf(logmsg, sizeof(logmsg), "sending Modbus request...\n");
+        // slog(logmsg);
         // modbus.readInputRegisters(0x03, 1358, 6);  // read 6 registers starting at address 1358 from device 3
         
         // modbus.readInputRegisters(0x03, 1001, 1);  // read 1 register starting at address 1001 from device 3
