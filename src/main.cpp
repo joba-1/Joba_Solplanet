@@ -89,8 +89,8 @@ bool postInflux(const char *line) {
     http.end();
 
     if (influx_status < 200 || influx_status >= 300) {
-        snprintf(msg, sizeof(msg), "Post %s:%d%s status=%d line='%s' response='%s'",
-            INFLUX_SERVER, INFLUX_PORT, uri, influx_status, line, payload.c_str());
+        snprintf(msg, sizeof(msg), "Post %s:%d%s line='%s' response='%s' status=%d",
+            INFLUX_SERVER, INFLUX_PORT, uri, line, payload.c_str(), influx_status);
         slog(msg, LOG_ERR);
         return false;
     }
