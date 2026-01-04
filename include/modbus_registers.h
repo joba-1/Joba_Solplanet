@@ -21,15 +21,19 @@ typedef struct {
 extern const RegisterInfo aiswei_registers[];
 extern const size_t aiswei_registers_count;
 
+extern const RegisterInfo sdm72_registers[];
+extern const size_t sdm72_registers_count;
+
 /**
  * Find index of register info for a given decimal AISWEI address.
  * If addr falls into a multi-register entry (addr .. addr+length-1) that entry is returned.
  * Returns -1 if not found.
  */
 int aiswei_find_register_index(uint32_t addr_dec);
+int sdm72_find_register_index(uint32_t addr_dec);
 
 // Helper (internal) - you can call directly if needed
-uint16_t aiswei_dec2reg(uint32_t addr_dec);
+uint16_t modbusAddressToOffset(uint32_t addr_dec);
 
 /* Read wrappers (input & holding read requests) */
 /* Input registers (chapter 3.3) - prototypes */

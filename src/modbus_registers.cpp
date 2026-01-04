@@ -4,6 +4,87 @@
 // the global modbus object is defined in main.cpp
 extern esp32ModbusRTU modbus;
 
+const RegisterInfo sdm72_registers[] = {
+    // ---------- Voltages ----------
+    {30001, 2, "Voltage L1-N",                    "Float", "V",     1.0f, "RO"},
+    {30003, 2, "Voltage L2-N",                    "Float", "V",     1.0f, "RO"},
+    {30005, 2, "Voltage L3-N",                    "Float", "V",     1.0f, "RO"},
+    {30043, 2, "Average L-N voltage",             "Float", "V",     1.0f, "RO"},
+
+    {30201, 2, "Voltage L1-L2",                   "Float", "V",     1.0f, "RO"},
+    {30203, 2, "Voltage L2-L3",                   "Float", "V",     1.0f, "RO"},
+    {30205, 2, "Voltage L3-L1",                   "Float", "V",     1.0f, "RO"},
+    {30207, 2, "Average L-L voltage",             "Float", "V",     1.0f, "RO"},
+
+    // ---------- Currents ----------
+    {30007, 2, "Current L1",                      "Float", "A",     1.0f, "RO"},
+    {30009, 2, "Current L2",                      "Float", "A",     1.0f, "RO"},
+    {30011, 2, "Current L3",                      "Float", "A",     1.0f, "RO"},
+    {30047, 2, "Average line current",            "Float", "A",     1.0f, "RO"},
+    {30049, 2, "Sum of line currents",            "Float", "A",     1.0f, "RO"},
+    {30225, 2, "Neutral current",                 "Float", "A",     1.0f, "RO"},
+
+    // ---------- Active Power ----------
+    {30013, 2, "Active power L1",                 "Float", "W",     1.0f, "RO"},
+    {30015, 2, "Active power L2",                 "Float", "W",     1.0f, "RO"},
+    {30017, 2, "Active power L3",                 "Float", "W",     1.0f, "RO"},
+    {30053, 2, "Total active power",              "Float", "W",     1.0f, "RO"},
+    {31281, 2, "Total import active power",       "Float", "W",     1.0f, "RO"},
+    {31283, 2, "Total export active power",       "Float", "W",     1.0f, "RO"},
+
+    // ---------- Apparent Power ----------
+    {30019, 2, "Apparent power L1",               "Float", "VA",    1.0f, "RO"},
+    {30021, 2, "Apparent power L2",               "Float", "VA",    1.0f, "RO"},
+    {30023, 2, "Apparent power L3",               "Float", "VA",    1.0f, "RO"},
+    {30057, 2, "Total apparent power",            "Float", "VA",    1.0f, "RO"},
+
+    // ---------- Reactive Power ----------
+    {30025, 2, "Reactive power L1",               "Float", "VAr",   1.0f, "RO"},
+    {30027, 2, "Reactive power L2",               "Float", "VAr",   1.0f, "RO"},
+    {30029, 2, "Reactive power L3",               "Float", "VAr",   1.0f, "RO"},
+    {30061, 2, "Total reactive power",            "Float", "VAr",   1.0f, "RO"},
+
+    // ---------- Power Factor ----------
+    {30031, 2, "Power factor L1",                 "Float", NULL,    1.0f, "RO"},
+    {30033, 2, "Power factor L2",                 "Float", NULL,    1.0f, "RO"},
+    {30035, 2, "Power factor L3",                 "Float", NULL,    1.0f, "RO"},
+    {30063, 2, "Total power factor",              "Float", NULL,    1.0f, "RO"},
+
+    // ---------- Frequency ----------
+    {30071, 2, "Frequency",                       "Float", "Hz",    1.0f, "RO"},
+
+    // ---------- Energy ----------
+    {30073, 2, "Import active energy",            "Float", "kWh",   1.0f, "RO"},
+    {30075, 2, "Export active energy",            "Float", "kWh",   1.0f, "RO"},
+    {30343, 2, "Total active energy",             "Float", "kWh",   1.0f, "RO"},
+    {30345, 2, "Total reactive energy",           "Float", "kVArh", 1.0f, "RO"},
+
+    {30385, 2, "Resettable total active energy",  "Float", "kWh",   1.0f, "RO"},
+    {30387, 2, "Resettable total reactive energy","Float", "kVArh", 1.0f, "RO"},
+    {30389, 2, "Resettable import energy",        "Float", "kWh",   1.0f, "RO"},
+    {30391, 2, "Resettable export energy",        "Float", "kWh",   1.0f, "RO"},
+    {30397, 2, "Net energy (Import-Export)",      "Float", "kWh",   1.0f, "RO"},
+
+    // ---------- Configuration / Special ----------
+    {40011, 2, "System type",                 "Float", NULL, 1.0f, "RW"}, // 1=1P2W, 3=3P4W
+    {40013, 2, "Pulse width",                 "Float", "ms", 1.0f, "RW"},
+    {40015, 2, "KPPA authorization",          "Float", NULL, 1.0f, "RW"},
+    {40019, 2, "Parity & stop bits",          "Float", NULL, 1.0f, "RW"},
+    {40021, 2, "Modbus address",              "Float", NULL, 1.0f, "RW"},
+    {40023, 2, "Pulse constant",              "Float", NULL, 1.0f, "RW"},
+    {40025, 2, "Password",                    "Float", NULL, 1.0f, "RW"},
+    {40029, 2, "Baud rate",                   "Float", NULL, 1.0f, "RW"},
+    {40059, 2, "Auto scroll time",            "Float", "s",  1.0f, "RW"},
+    {40061, 2, "Backlight time",              "Float", "min",1.0f, "RW"},
+    {40087, 2, "Pulse 1 energy type",         "Float", NULL, 1.0f, "RW"},
+
+    // Special registers
+    {461457 ,1, "Reset historical data",      "U16",   NULL, 1.0f, "WO"},  // write 3 to reset
+    {464513 ,2, "Serial number",              "U32",   NULL, 1.0f, "RO"},
+    {464515 ,1, "Meter code",                 "U16",   NULL, 1.0f, "RO"},
+    {464645 ,1, "Software version",           "U16",   NULL, 1.0f, "RO"},
+};
+
 // table extracted from chapter 3.3 of MB001_ASW GEN-Modbus-en_V2.1.1.
 // addr = decimal AISWEI address, length = number of 16-bit registers
 // name = first line of description, type, unit, gain, access
@@ -267,6 +348,7 @@ const RegisterInfo aiswei_registers[] = {
 
 // define count of entries
 const size_t aiswei_registers_count = sizeof(aiswei_registers) / sizeof(aiswei_registers[0]);
+const size_t sdm72_registers_count = sizeof(sdm72_registers) / sizeof(sdm72_registers[0]);
 
 int aiswei_find_register_index(uint32_t addr_dec) {
     for (size_t i = 0; i < aiswei_registers_count; ++i) {
@@ -277,11 +359,34 @@ int aiswei_find_register_index(uint32_t addr_dec) {
     return -1;
 }
 
-// Convert AISWEI decimal address (e.g. 31001) to Modbus register index:
-// strip leading '3' or '4' (equivalent to addr % 10000), then subtract 1.
-uint16_t aiswei_dec2reg(uint32_t addr_dec) {
-    uint32_t v = addr_dec % 10000;
-    return static_cast<uint16_t>((v == 0) ? 0 : (v - 1));
+int sdm72_find_register_index(uint32_t addr_dec) {
+    for (size_t i = 0; i < sdm72_registers_count; ++i) {
+        uint32_t start = sdm72_registers[i].addr;
+        uint32_t end = start + (sdm72_registers[i].length > 0 ? (sdm72_registers[i].length - 1) : 0);
+        if (addr_dec >= start && addr_dec <= end) return (int)i;
+    }
+    return -1;
+}
+
+uint16_t modbusAddressToOffset(uint32_t address)
+{
+    // Input registers (3X)
+    if (address >= 30001 && address <= 39999) {
+        return static_cast<uint16_t>(address - 30001);
+    }
+
+    // Holding registers (4X)
+    if (address >= 40001 && address <= 49999) {
+        return static_cast<uint16_t>(address - 40001);
+    }
+
+    // Extended holding registers (Eastron specific 46xxxx)
+    if (address >= 460001) {
+        return static_cast<uint16_t>(address - 460001);
+    }
+
+    // Invalid address
+    return 0xFFFF;
 }
 
 static void requestAisweiRead(uint8_t slave, uint32_t addr_dec) {
@@ -289,7 +394,7 @@ static void requestAisweiRead(uint8_t slave, uint32_t addr_dec) {
     int idx = aiswei_find_register_index(addr_dec);
     uint16_t length = 1;
     if (idx >= 0) length = aiswei_registers[idx].length;
-    uint16_t reg = aiswei_dec2reg(addr_dec);
+    uint16_t reg = modbusAddressToOffset(addr_dec);
 
     if (addr_dec >= 40000 && addr_dec < 50000) {
         // addresses starting with 4xxxx are holding registers
@@ -552,14 +657,14 @@ void LVRT_activePowerLimitMode(uint8_t slave) { requestAisweiRead(slave, 45609);
 
 /* --- generic write helpers --- */
 bool writeRegisterU16(uint8_t slave, uint32_t addr_dec, uint16_t value) {
-    uint16_t reg = aiswei_dec2reg(addr_dec);
+    uint16_t reg = modbusAddressToOffset(addr_dec);
     // write single 16-bit holding register
     // (assumes esp32ModbusRTU provides writeSingleRegister)
     return modbus.writeSingleHoldingRegister(slave, reg, value);
 }
 
 bool writeRegisterU32(uint8_t slave, uint32_t addr_dec, uint32_t value) {
-    uint16_t reg = aiswei_dec2reg(addr_dec);
+    uint16_t reg = modbusAddressToOffset(addr_dec);
     uint16_t vals[2];
     vals[0] = static_cast<uint16_t>((value >> 16) & 0xFFFF); // high word first
     vals[1] = static_cast<uint16_t>(value & 0xFFFF);

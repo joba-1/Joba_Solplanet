@@ -236,7 +236,7 @@ static void ensureMqttConnected() {
     mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
     snprintf(logmsg, sizeof(logmsg), "Connecting to MQTT %s:%d ...\n", MQTT_SERVER, MQTT_PORT);
     slog(logmsg);
-    // client id: joba_solplanet + last 4 of chip id
+    // client id: topic prefix + last 4 of chip id
     uint32_t chipid = (uint32_t)ESP.getEfuseMac();
     char clientId[40];
     snprintf(clientId, sizeof(clientId), "%s-%08X", mqttPrefix, (unsigned int)(chipid & 0xFFFFFFFF));
@@ -252,9 +252,13 @@ static void ensureMqttConnected() {
 static void decodeAndPublish(uint8_t unit, esp32Modbus::FunctionCode fc, uint16_t reg, uint8_t* data, size_t length) {
     // find matching register definition by comparing register offsets
     const RegisterInfo* ri = nullptr;
-    for (size_t i = 0; i < aiswei_registers_count; ++i) {
-        const RegisterInfo &r = aiswei_registers[i];
-        uint16_t regOff = aiswei_dec2reg(r.addr);
+
+    auto count = (unit == 3) ? aiswei_registers_count : sdm72_registers_count;
+    auto regs = (unit == 3) ? aiswei_registers : sdm72_registers;
+
+    for (size_t i = 0; i < count; ++i) {
+        const RegisterInfo &r = regs[i];
+        uint16_t regOff = modbusAddressToOffset(r.addr);
         if (reg >= regOff && reg < regOff + r.length) {
             ri = &r;
             break;
@@ -404,16 +408,25 @@ static void decodeAndPublish(uint8_t unit, esp32Modbus::FunctionCode fc, uint16_
         return;
     }
 
-    if (strcmp(type, "U32") == 0 || strcmp(type, "S32") == 0) {
-        if (length >= 4) {
-            uint32_t raw = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | (uint32_t)data[3];
-            if (strcmp(type, "S32") == 0) {
-                int32_t s = (int32_t)raw;
-                fmt_with_gain(s);
-            } else {
-                fmt_with_gain(raw);
-            }
+    if (strcmp(type, "U32") == 0 || strcmp(type, "S32") == 0 && length >= 4) {
+        uint32_t raw = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | (uint32_t)data[3];
+        if (strcmp(type, "S32") == 0) {
+            int32_t s = (int32_t)raw;
+            fmt_with_gain(s);
+        } else {
+            fmt_with_gain(raw);
         }
+        if (mqttClient.connected()) mqttClient.publish(topic, payload);
+        sendInfluxData(unit, fc, reg, slug, payload);
+        snprintf(logmsg, sizeof(logmsg), "%s -> %s\n", ri->name, payload);
+        slog(logmsg);
+        return;
+    }
+
+    if (strcmp(type, "Float") == 0 && length >= 4) {
+        uint32_t raw = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | (uint32_t)data[3];
+        float f = *(float*)&raw;
+        fmt_with_gain(f);
         if (mqttClient.connected()) mqttClient.publish(topic, payload);
         sendInfluxData(unit, fc, reg, slug, payload);
         snprintf(logmsg, sizeof(logmsg), "%s -> %s\n", ri->name, payload);
@@ -721,7 +734,7 @@ void handle_modbus() {
                         // find matching register definition by comparing register offsets
                         for (size_t j = 0; j < aiswei_registers_count; ++j) {
                             const RegisterInfo &r = aiswei_registers[j];
-                            uint16_t rOff = aiswei_dec2reg(r.addr);
+                            uint16_t rOff = modbusAddressToOffset(r.addr);
                             if (regOff == rOff) {
                                 regLen = r.length * 2;  // length in bytes
                                 break;
