@@ -253,6 +253,7 @@ static void decodeAndPublish(uint8_t unit, esp32Modbus::FunctionCode fc, uint16_
     // find matching register definition by comparing register offsets
     const RegisterInfo* ri = nullptr;
 
+    // unit 1: sdm72, unit 3: aiswei inverter
     auto count = (unit == 3) ? aiswei_registers_count : sdm72_registers_count;
     auto regs = (unit == 3) ? aiswei_registers : sdm72_registers;
 
@@ -723,17 +724,20 @@ void handle_modbus() {
                 if (!pair.has_request || !pair.has_response || pair.request.quantity == 0 || (pair.response.byte_count & 1)) {
                     decoded = false;
                 } else {
-                    // decode according to AISWEI register metadata and publish readable payload
+                    // decode according to AISWEI/SDM register metadata and publish readable payload
                     auto & resp = pair.response; 
                     auto & req = pair.request; 
                     esp32Modbus::FunctionCode fc = (esp32Modbus::FunctionCode)req.function_code;
                     uint16_t addr = req.start_address;
+                    // unit 1: sdm72, unit 3: aiswei inverter
+                    auto count = (req.slave_id == 3) ? aiswei_registers_count : sdm72_registers_count;
+                    auto regs = (req.slave_id == 3) ? aiswei_registers : sdm72_registers;
                     for (uint16_t i = 0; i < resp.byte_count; i += 2) {
                         uint16_t regOff = addr + (i / 2);
                         size_t regLen = 2;
                         // find matching register definition by comparing register offsets
-                        for (size_t j = 0; j < aiswei_registers_count; ++j) {
-                            const RegisterInfo &r = aiswei_registers[j];
+                        for (size_t j = 0; j < count; ++j) {
+                            const RegisterInfo &r = regs[j];
                             uint16_t rOff = modbusAddressToOffset(r.addr);
                             if (regOff == rOff) {
                                 regLen = r.length * 2;  // length in bytes
