@@ -124,6 +124,8 @@ bool sendInfluxData(uint8_t unit, uint8_t function_code, uint16_t reg, const cha
 #include <esp32ModbusRTU.h>
 #include "modbus_registers.h"
 
+bool modbus_idle = false;  // if true, we can send our own requests
+
 // esp32ModbusRTU modbus(&Serial1, -1);  // use Serial1 and no pin as RTS
 
 // translate AISWEI warning codes to descriptive strings
@@ -409,7 +411,7 @@ static void decodeAndPublish(uint8_t unit, esp32Modbus::FunctionCode fc, uint16_
         return;
     }
 
-    if (strcmp(type, "U32") == 0 || strcmp(type, "S32") == 0 && length >= 4) {
+    if ((strcmp(type, "U32") == 0 || strcmp(type, "S32") == 0) && length >= 4) {
         uint32_t raw = ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | (uint32_t)data[3];
         if (strcmp(type, "S32") == 0) {
             int32_t s = (int32_t)raw;
@@ -705,6 +707,7 @@ void handle_modbus() {
     uint32_t now = millis();
 
     while (Serial1.available() && pos < sizeof(data)) {
+        modbus_idle = false;
         int c = Serial1.read();
         if (c < 0) break;
         now = millis();
@@ -715,6 +718,7 @@ void handle_modbus() {
     if (pos > 0) {
         uint32_t timeout = (pos <= 8) ? 300 : MODBUS_TIMEOUT;
         if (now - last >= timeout) {
+            modbus_idle = true;
             ModbusRtuDecoder::FramePair pair = {};
             ModbusRtuDecoder decoder;
             bool decoded = decoder.split_request_response(data, pos, pair);
@@ -764,6 +768,7 @@ void handle_modbus() {
 
 void loop() {
     static uint32_t lastMillis = 0;
+    static bool send_modbus_request = false;
     
     if (handle_wifi()) {
         check_ntptime();
@@ -781,6 +786,7 @@ void loop() {
 
     if (millis() - lastMillis > 5000) {
         lastMillis = millis();
+        send_modbus_request = true;
         // sniffer_print_frames();
 
         slog("ping", LOG_NOTICE);
@@ -790,5 +796,19 @@ void loop() {
         // modbus.readInputRegisters(0x03, 1358, 6);  // read 6 registers starting at address 1358 from device 3
         
         // modbus.readInputRegisters(0x03, 1001, 1);  // read 1 register starting at address 1001 from device 3
+    }
+
+    if (send_modbus_request && modbus_idle) {
+        send_modbus_request = false;
+        // read registers    unit, fc,   start addr, quantity, crc lo, crc hi 
+        // uint8_t request[] = {0x03, 0x04, 0x05, 0x57, 0x00, 0x08, 0x00, 0x00};
+        // uint8_t request[] = {0x01, 0x04, 0x00, 0xc8, 0x00, 0x02, 0x00, 0x00};
+        // uint16_t crc = ModbusRtuDecoder::calculate_crc16(request, sizeof(request) - 2);
+        // request[sizeof(request) - 2] = crc & 0xFF;
+        // request[sizeof(request) - 1] = (crc >> 8) & 0xFF;
+        // snprintf(logmsg, sizeof(logmsg), "sending Modbus request %08llx\n", *((uint64_t*)request));
+        // slog(logmsg);
+        // Serial1.write(request, sizeof(request));
+        // Serial1.flush();
     }
 }
