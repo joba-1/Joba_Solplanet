@@ -712,28 +712,6 @@ void decodeAndPublish(uint8_t unitId, uint16_t addr, uint8_t* data, size_t lengt
     }
 }
 
-// MQTT polling thread
-static void mqttThread() {
-    try {
-        auto opts = mqtt::connect_options_builder()
-                        .keep_alive_interval(std::chrono::seconds(60))
-                        .clean_session(false)
-                        .automatic_reconnect(true)
-                        .finalize();
-        
-        mqttClient = new mqtt::client(
-            std::string("tcp://") + MQTT_SERVER + ":" + std::to_string(MQTT_PORT), MQTT_TOPIC_PREFIX
-        );
-        
-        LOG("Connecting to MQTT %s:%d", MQTT_SERVER, MQTT_PORT);
-        mqttClient->connect(opts);
-        LOG("MQTT connected for topics %s/#", MQTT_TOPIC_PREFIX);
-        
-    } catch (const mqtt::exception& exc) {
-        LOG("MQTT connection failed: %s", exc.what());
-    }
-}
-
 // Helper function to check if a range contains any changed addresses
 static bool rangeContainsChangedAddress(unsigned startIdx, unsigned k) {
     for (unsigned i = 0; i < k; ++i) {
@@ -835,7 +813,7 @@ static void modbusThread() {
                         if (std::find(changedAddressesRanges.begin(), changedAddressesRanges.end(), startIdx) 
                             == changedAddressesRanges.end()) {
                             changedAddressesRanges.push_back(startIdx);
-                            LOG("Added range to changed list: idx=%u (total changed ranges=%zu)", startIdx, changedAddressesRanges.size());
+                            // LOG("Added range to changed list: idx=%u (total changed ranges=%zu)", startIdx, changedAddressesRanges.size());
                         }
                     }
 
@@ -877,9 +855,25 @@ int main(int argc, char** argv) {
         if (pos == std::string::npos) influxMeasurement = prefix; else influxMeasurement = prefix.substr(pos+1);
     }
 
-    // Start MQTT thread
-    std::thread mqtt_th(mqttThread);
-    mqtt_th.detach();
+    // Start MQTT
+    try {
+        auto opts = mqtt::connect_options_builder()
+                        .keep_alive_interval(std::chrono::seconds(60))
+                        .clean_session(false)
+                        .automatic_reconnect(true)
+                        .finalize();
+        
+        mqttClient = new mqtt::client(
+            std::string("tcp://") + MQTT_SERVER + ":" + std::to_string(MQTT_PORT), MQTT_TOPIC_PREFIX
+        );
+        
+        LOG("Connecting to MQTT %s:%d", MQTT_SERVER, MQTT_PORT);
+        mqttClient->connect(opts);
+        LOG("MQTT connected for topics %s/#", MQTT_TOPIC_PREFIX);
+        
+    } catch (const mqtt::exception& exc) {
+        LOG("MQTT connection failed: %s", exc.what());
+    }
 
     // Initialize aiswei_registers array for testing (iterating through all entries): 
     // each word as unsigned 16-bit at addresses 30000..49999
@@ -901,14 +895,15 @@ int main(int argc, char** argv) {
     std::string command;
     std::cout << "Type 'quit' to exit..." << std::endl;
     
-    while (running && std::getline(std::cin, command)) {
-        if (command == "quit" || command == "exit") {
-            running = false;
-            break;
-        }
-    }
+    // while (running && std::getline(std::cin, command)) {
+    //     if (command == "quit" || command == "exit") {
+    //         running = false;
+    //         break;
+    //     }
+    // }
 
     // Cleanup
+    modbus_th.join();
     running = false;
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     
